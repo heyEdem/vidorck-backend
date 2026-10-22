@@ -29,3 +29,4 @@ Thumbs.db
 !.env.example
 /database/*.sqlite*
 /storage/backups
+/deploy/*.env

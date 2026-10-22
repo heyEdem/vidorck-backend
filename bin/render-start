@@ -26,6 +26,13 @@ touch "$DB_DATABASE"
 # Apply Render's runtime environment before touching the mounted database.
 php artisan config:clear
 php artisan migrate --force
+# Without a persistent disk each start begins empty, so reseed idempotently.
+php artisan db:seed --force
+if [ -n "${BOOTSTRAP_ADMIN_EMAIL:-}" ]; then
+    # Bad credentials must not crash-loop the API; log and keep serving.
+    php artisan staff:create-admin --from-env \
+        || echo 'Admin bootstrap failed; check BOOTSTRAP_ADMIN_* values.' >&2
+fi
 php artisan storage:link --force
 
 # Keep the SQLite-backed queue and scheduler in the same service as the web app.

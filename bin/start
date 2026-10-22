@@ -18,7 +18,10 @@ case "$mode" in
     ;;
   prod)
     host=0.0.0.0
-    queue=(php artisan queue:work --tries=3 --max-time=3600)
+    # --max-time recycles the worker hourly with exit 0; respawn it so that
+    # doesn't restart the whole set (a restart wipes a disk-less Render demo).
+    work_queue() { while php artisan queue:work --tries=3 --max-time=3600; do :; done; }
+    queue=(work_queue)
     php artisan optimize
     export PHP_CLI_SERVER_WORKERS="${PHP_CLI_SERVER_WORKERS:-4}"
     ;;

@@ -12,23 +12,36 @@ use Illuminate\Support\Facades\Validator;
 
 final class CreateAdminCommand extends Command
 {
-    protected $signature = 'staff:create-admin {--force : Allow an additional Admin account}';
+    protected $signature = 'staff:create-admin
+        {--force : Allow an additional Admin account}
+        {--from-env : Read credentials from BOOTSTRAP_ADMIN_* and skip if an Admin exists}';
 
     protected $description = 'Create an Admin using interactive credentials; never replaces an existing account';
 
     public function handle(): int
     {
-        if (StaffUser::where('role', StaffRole::ADMIN)->exists() && ! $this->option('force')) {
-            $this->error('An Admin already exists. Use --force to create an additional Admin.');
+        $fromEnv = (bool) $this->option('from-env');
 
-            return self::FAILURE;
+        if (StaffUser::where('role', StaffRole::ADMIN)->exists()) {
+            // Boot-time bootstrap is idempotent and never adds a second Admin.
+            if ($fromEnv) {
+                $this->info('An Admin already exists; skipping bootstrap.');
+
+                return self::SUCCESS;
+            }
+            if (! $this->option('force')) {
+                $this->error('An Admin already exists. Use --force to create an additional Admin.');
+
+                return self::FAILURE;
+            }
         }
 
-        $input = [
+        $input = $fromEnv ? (array) config('auth.bootstrap_admin') : [
             'name' => $this->ask('Name'),
-            'email' => mb_strtolower(trim((string) $this->ask('Email'))),
+            'email' => $this->ask('Email'),
             'password' => $this->secret('Password'),
         ];
+        $input['email'] = mb_strtolower(trim((string) $input['email']));
         $validator = Validator::make($input, [
             'name' => ['required', 'string', 'max:255'],
             'email' => ['required', 'email', 'max:255', 'unique:staff_users,email'],

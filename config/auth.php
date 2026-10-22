@@ -114,4 +114,11 @@ return [
 
     'password_timeout' => env('AUTH_PASSWORD_TIMEOUT', 10800),
 
+    // Read by `staff:create-admin --from-env` at container start (Render demo has no shell).
+    'bootstrap_admin' => [
+        'name' => env('BOOTSTRAP_ADMIN_NAME', 'Vidorck Admin'),
+        'email' => env('BOOTSTRAP_ADMIN_EMAIL'),
+        'password' => env('BOOTSTRAP_ADMIN_PASSWORD'),
+    ],
+
 ];

@@ -173,3 +173,22 @@
   SQLite and uploaded media in a named Docker volume.
 - Added local HTTP cookie settings, a health check, and documented local startup
   and administrator creation commands.
+
+## 2026-10-22 — Render and Vercel domain configuration
+
+- Filled deployment environment templates using the frontend's canonical
+  `https://www.vidorckhair.com` origin, `/admin`, checkout return route, and cache
+  refresh endpoint.
+- Matched Laravel's session cookie with the frontend proxy's cookie setting and
+  documented the shared parent domain required for admin authentication.
+- Documented the `api.vidorckhair.com` Render custom-domain prerequisite and the
+  shared cache refresh secret; excluded filled credential files from Git and Docker.
+
+## 2026-10-22 — Render demo startup bootstrap
+
+- The Render startup script now runs the idempotent catalogue seeders and, when
+  `BOOTSTRAP_ADMIN_EMAIL` is set, `staff:create-admin --from-env`, which creates the
+  first Admin from `BOOTSTRAP_ADMIN_*` only if none exists. Failures are logged
+  without stopping the API, so no Render shell is needed.
+- The production queue worker now respawns after its hourly `--max-time` exit
+  instead of restarting the whole service, which would reset a disk-less demo.

@@ -21,3 +21,4 @@ tests
 .phpunit.cache
 .phpunit.result.cache
 compose.yaml
+deploy/*.env*

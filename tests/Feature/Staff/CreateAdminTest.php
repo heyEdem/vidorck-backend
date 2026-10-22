@@ -1,6 +1,7 @@
 <?php
 
 use App\Modules\Staff\Enums\StaffRole;
+use App\Modules\Staff\Models\AuditLog;
 use App\Modules\Staff\Models\StaffUser;
 use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Support\Facades\Hash;
@@ -38,3 +39,29 @@ it('allows an additional admin only with force and rejects weak passwords', func
         ->expectsQuestion('Password', 'Another-Strong-Password7!')->assertSuccessful();
     expect(StaffUser::count())->toBe(2);
 });
+
+it('bootstraps an admin from config once and stays idempotent', function () {
+    config(['auth.bootstrap_admin' => ['name' => 'Boot', 'email' => ' BOOT@example.com ', 'password' => 'Long-Staff-Password9!']]);
+
+    $this->artisan('staff:create-admin --from-env')->assertSuccessful();
+    $admin = StaffUser::sole();
+    expect($admin->email)->toBe('boot@example.com')
+        ->and(Hash::check('Long-Staff-Password9!', $admin->password))->toBeTrue()
+        ->and(AuditLog::where('action', 'staff.bootstrap')->count())->toBe(1);
+
+    config(['auth.bootstrap_admin.password' => 'Changed-Staff-Password9!']);
+    $this->artisan('staff:create-admin --from-env')->assertSuccessful();
+    expect(StaffUser::count())->toBe(1)
+        ->and(Hash::check('Long-Staff-Password9!', $admin->fresh()->password))->toBeTrue()
+        ->and(AuditLog::where('action', 'staff.bootstrap')->count())->toBe(1);
+});
+
+it('rejects missing or weak bootstrap credentials without creating an admin', function (array $credentials) {
+    config(['auth.bootstrap_admin' => $credentials]);
+
+    $this->artisan('staff:create-admin --from-env')->assertFailed();
+    expect(StaffUser::count())->toBe(0)->and(AuditLog::count())->toBe(0);
+})->with([
+    'missing' => [['name' => 'Boot', 'email' => null, 'password' => null]],
+    'weak password' => [['name' => 'Boot', 'email' => 'boot@example.com', 'password' => 'weak']],
+]);
