@@ -1,0 +1,3055 @@
+openapi: 3.0.3
+info:
+  title: Vidorck Hair API
+  version: 1.0.0
+  description: >-
+    Public catalogue and staff APIs for Vidorck Hair, including authentication, roles, audit, products, variants, bundles, and images. Amounts are integer GHS pesewas.
+servers:
+  - url: http://localhost:8000
+    description: Local
+  - url: https://staging-api.vidorckhair.com
+    description: Staging
+  - url: https://api.vidorckhair.com
+    description: Production
+paths:
+  /up:
+    get:
+      operationId: healthCheck
+      summary: Check application health
+      responses:
+        '200':
+          description: Application is available (Laravel health response).
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+        '500':
+          description: Application health check failed.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+  /sanctum/csrf-cookie:
+    get:
+      operationId: csrfCookie
+      summary: Initialize Sanctum SPA CSRF cookies
+      description: >-
+        Call from the configured admin origin with credentials included before
+        staff login. Submit the decoded XSRF-TOKEN cookie in X-XSRF-TOKEN on
+        subsequent unsafe requests.
+      responses:
+        '204':
+          description: CSRF and session cookies initialized.
+          headers:
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+            Set-Cookie:
+              schema:
+                type: string
+              description: XSRF-TOKEN and session cookies (multiple headers).
+  /api/v1/checkout:
+    post:
+      operationId: createCheckout
+      summary: Validate a cart, create a payment attempt, and initialize Paystack
+      description: >-
+        Prices are resolved from the current public catalogue. Client-supplied price and amount fields are ignored.
+        At most 100 cart lines are accepted. A matching expectedUnitPriceMinor may be supplied to reject stale prices.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/CheckoutRequest'}
+      responses:
+        '201':
+          description: Paystack authorization details.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CheckoutResponse'}
+        '422':
+          description: Invalid checkout input, unavailable line, stale price, or unsupported delivery area.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CheckoutError'}
+        '503':
+          description: Payment provider could not initialize the transaction.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Checkout initialization rate limit exceeded (10 requests per minute per IP).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/v1/checkout/{reference}:
+    get:
+      operationId: getCheckoutStatus
+      summary: Poll a checkout payment attempt
+      description: >-
+        Returns only customer-safe payment status. Pending attempts older than 10 seconds are verified with
+        Paystack at most once per 10 seconds. Expired attempts are verified before they are marked abandoned.
+        Provider verification failures leave status pending. This endpoint is limited to 30 requests per minute per IP.
+      parameters:
+        - name: reference
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: Current checkout status.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CheckoutStatusResponse'}
+        '404':
+          description: No checkout attempt exists for the supplied reference.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Checkout status rate limit exceeded (30 requests per minute per IP).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/v1/checkout/{reference}/retry:
+    post:
+      operationId: retryCheckout
+      summary: Retry a failed checkout payment
+      description: >-
+        Revalidates the saved customer, delivery, and cart snapshot against the active catalogue and current prices.
+        Only final FAILED or ABANDONED attempts and expired PENDING attempts can be retried. Paystack is verified
+        before a new initialization; provider states that are still in progress block the retry even after local
+        expiry. Each attempt can have at most one immediate retry.
+      parameters:
+        - name: reference
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '201':
+          description: New Paystack authorization details.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CheckoutResponse'}
+        '404':
+          description: No checkout attempt exists for the supplied reference.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: The attempt is pending, paid, mismatched, or already retried.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '422':
+          description: Saved checkout details, delivery area, product, or price are no longer valid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CheckoutError'}
+        '503':
+          description: Provider verification or initialization is unavailable.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Checkout initialization rate limit exceeded (10 requests per minute per IP).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/v1/orders/cancellation-requests:
+    post:
+      operationId: requestOrderCancellation
+      summary: Request cancellation or refund before dispatch
+      description: >-
+        Verifies order number plus phone (normalised) and records one open request per order. Allowed only while
+        the order is PAID, PROCESSING, or READY_FOR_DISPATCH. Does not change the order status or refund anything.
+        Unknown orders, wrong phones, and malformed phones return the same generic 404. Rate limit: 5 per minute
+        and 20 per hour per IP, plus 10 per hour per order number.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderNumber, phone, reason]
+              properties:
+                orderNumber: {type: string, maxLength: 40}
+                phone: {type: string, maxLength: 20}
+                reason: {type: string, minLength: 5, maxLength: 1000}
+      responses:
+        '201':
+          description: Request recorded.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [status, requestedAt]
+                    properties:
+                      status: {type: string, enum: [REQUESTED]}
+                      requestedAt: {type: string, format: date-time}
+        '404':
+          description: Generic not found (unknown order or phone mismatch).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: Order is dispatched or closed (CANCELLATION_NOT_ALLOWED) or already has an open request (CANCELLATION_ALREADY_REQUESTED).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '422':
+          description: Validation failed.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/v1/complaints:
+    post:
+      operationId: submitComplaint
+      summary: Submit a support message
+      description: >-
+        Stores the message as a complaint and returns its reference. Rate limit: 3 per 10 minutes per IP.
+        A filled hidden `website` field (honeypot) returns a normal acknowledgement without storing the submission.
+        Control characters are rejected. A customer acknowledgement is sent on the selected channel.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, topic, message, contactMethod]
+              properties:
+                name: {type: string, minLength: 2, maxLength: 100}
+                topic: {type: string, enum: [ORDER_PROBLEM, PRODUCT_QUESTION, OTHER]}
+                orderNumber: {type: string, nullable: true, maxLength: 100}
+                message: {type: string, maxLength: 5000}
+                contactMethod: {type: string, enum: [CALL, WHATSAPP, EMAIL]}
+                phone: {type: string, nullable: true, maxLength: 20, description: 'Ghana phone number, required for CALL and WHATSAPP.'}
+                email: {type: string, format: email, nullable: true, maxLength: 254, description: "Required for EMAIL."}
+                website: {type: string, description: Honeypot. Must be left empty.}
+      responses:
+        '201':
+          description: Complaint stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: object
+                    required: [reference, status]
+                    properties:
+                      reference: {type: string, example: C-000123}
+                      status: {type: string, enum: [NEW]}
+        '200':
+          description: Honeypot acknowledgement; nothing was stored.
+        '422':
+          description: Validation failed.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/v1/orders/track:
+    post:
+      operationId: trackOrder
+      summary: Track an order by order number and phone
+      description: >-
+        Order number and phone are normalised. Unknown orders, wrong phones, and malformed phones return the same
+        generic 404 body. The response is customer-safe only: no notes, staff, reasons, payment references, tracking
+        token, or courier details. Rate limit: 5 per minute and 20 per hour per IP, plus 10 per hour per order number.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderNumber, phone]
+              properties:
+                orderNumber: {type: string, maxLength: 40}
+                phone: {type: string, maxLength: 20}
+      responses:
+        '200':
+          description: Customer-safe order view.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: {$ref: '#/components/schemas/CustomerOrder'}
+        '404':
+          description: Generic not found (unknown order or phone mismatch).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '422':
+          description: Validation failed.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/v1/orders/confirmation/{trackingToken}:
+    parameters:
+      - {name: trackingToken, in: path, required: true, schema: {type: string}}
+    get:
+      operationId: getOrderConfirmation
+      summary: Compact order success payload for the confirmation page
+      description: The 32-character random tracking token is the capability; no phone is required. Rate limit 30 per minute per IP.
+      responses:
+        '200':
+          description: Compact confirmation payload.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: {$ref: '#/components/schemas/OrderConfirmation'}
+        '404':
+          description: Unknown token.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: Rate limit exceeded.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/v1/webhooks/paystack:
+    post:
+      operationId: receivePaystackWebhook
+      summary: Receive and queue a signed Paystack event
+      description: >-
+        Verifies the raw request body with HMAC-SHA512 using x-paystack-signature. Valid receipts are stored
+        idempotently and queued for provider verification; the response does not imply that payment is confirmed.
+        This endpoint does not use the staff session or CSRF middleware.
+      parameters:
+        - name: x-paystack-signature
+          in: header
+          required: true
+          schema: {type: string, pattern: '^[a-fA-F0-9]{128}$'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PaystackWebhook'}
+      responses:
+        '200':
+          description: Signed event receipt stored or already received.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PaystackWebhookResponse'}
+        '400':
+          description: Signed request body is malformed JSON.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401':
+          description: Signature is missing or invalid.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '422':
+          description: Signed event is missing required event data.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+  /api/v1/products:
+    get:
+      operationId: listPublicProducts
+      summary: List publicly visible products
+      description: >-
+        Returns published products with an active variant whose category is active. Search is case- and
+        diacritic-insensitive and treats percent and underscore as literal characters. Category and hair_type
+        accept either a slug or a display name. Facet counts always describe the global publicly visible set,
+        independent of the active query filters.
+      parameters:
+        - {name: q, in: query, description: Normalized product-name search, schema: {type: string, maxLength: 100}}
+        - {name: category, in: query, description: Category slug or display name, schema: {type: string, maxLength: 120}}
+        - {name: hair_type, in: query, description: Hair type slug or display name, schema: {type: string, maxLength: 120}}
+        - {name: page, in: query, schema: {type: integer, minimum: 1, default: 1}}
+      responses:
+        '200':
+          description: Public-safe product resources and global facets, 15 per page.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PublicProductPageResponse'}
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/products/{slug}:
+    parameters:
+      - {name: slug, in: path, required: true, schema: {type: string}}
+    get:
+      operationId: showPublicProduct
+      summary: Read a publicly visible product
+      responses:
+        '200':
+          description: Public-safe product resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PublicProductResponse'}
+        '301':
+          description: Permanent slug redirect. The target is returned only if it is publicly visible.
+          headers:
+            Location:
+              schema: {type: string}
+              example: /api/v1/products/new-slug
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SlugRedirectResponse'}
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/bundles:
+    get:
+      operationId: listPublicBundles
+      summary: List publicly visible bundles
+      description: Returns published bundles with at least one item, where every item references an active variant of a publicly visible product.
+      parameters:
+        - {name: page, in: query, schema: {type: integer, minimum: 1, default: 1}}
+      responses:
+        '200':
+          description: Public-safe bundle resources, 15 per page.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PublicBundlePageResponse'}
+  /api/v1/bundles/{slug}:
+    parameters:
+      - {name: slug, in: path, required: true, schema: {type: string}}
+    get:
+      operationId: showPublicBundle
+      summary: Read a publicly visible bundle
+      responses:
+        '200':
+          description: Public-safe bundle resource with public product and variant resources for each item.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PublicBundleResponse'}
+        '301':
+          description: Permanent slug redirect. The target is returned only if it is publicly visible.
+          headers:
+            Location:
+              schema: {type: string}
+              example: /api/v1/bundles/new-slug
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SlugRedirectResponse'}
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/categories:
+    get:
+      operationId: listPublicCategories
+      summary: List active categories
+      responses:
+        '200':
+          description: Active category resources in display order.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CategoryListResponse'}
+  /api/v1/delivery-areas:
+    get:
+      operationId: listPublicDeliveryAreas
+      summary: List active delivery areas
+      responses:
+        '200':
+          description: Active delivery areas in display order, with storefront-safe fields.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DeliveryAreaListResponse'}
+  /api/v1/hair-types:
+    get:
+      operationId: listPublicHairTypes
+      summary: List hair types
+      responses:
+        '200':
+          description: Hair type resources in display order.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HairTypeListResponse'}
+  /api/v1/admin/products:
+    get:
+      operationId: adminListProducts
+      summary: List catalogue products (catalogue readers)
+      security: [{sanctumSession: []}]
+      parameters:
+        - {name: page, in: query, schema: {type: integer, minimum: 1, default: 1}}
+        - {name: perPage, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 15}}
+        - {name: q, in: query, schema: {type: string, maxLength: 255}}
+        - {name: categoryId, in: query, schema: {type: integer, minimum: 1}}
+        - {name: isPublished, in: query, schema: {type: boolean}}
+      responses:
+        '200':
+          description: Admin product resources with pagination metadata.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminProductPageResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+    post:
+      operationId: adminCreateProduct
+      summary: Create a catalogue product (Admin only)
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AdminProductCreate'}
+      responses:
+        '201':
+          description: Created admin product resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminProductResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/products/{product}:
+    parameters:
+      - {name: product, in: path, required: true, schema: {type: integer, minimum: 1}}
+    get:
+      operationId: adminShowProduct
+      summary: Read a product and its variants (catalogue readers)
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Admin product resource, including source prices and internal IDs.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminProductResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    patch:
+      operationId: adminUpdateProduct
+      summary: Update product details (Admin only)
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AdminProductUpdate'}
+      responses:
+        '200':
+          description: Updated admin product resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminProductResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/products/{product}/publish:
+    parameters:
+      - {name: product, in: path, required: true, schema: {type: integer, minimum: 1}}
+    post:
+      operationId: adminPublishProduct
+      summary: Publish a product (catalogue publisher)
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Updated admin product resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminProductResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+  /api/v1/admin/products/{product}/unpublish:
+    parameters:
+      - {name: product, in: path, required: true, schema: {type: integer, minimum: 1}}
+    post:
+      operationId: adminUnpublishProduct
+      summary: Unpublish a product (catalogue publisher)
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Updated admin product resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminProductResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+  /api/v1/admin/products/{product}/variants:
+    parameters:
+      - {name: product, in: path, required: true, schema: {type: integer, minimum: 1}}
+    get:
+      operationId: adminListProductVariants
+      summary: List a product's variants (catalogue readers)
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Variant resources including source prices and internal IDs.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminVariantListResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    post:
+      operationId: adminCreateProductVariant
+      summary: Add a variant to a product (Admin only)
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AdminVariantCreate'}
+      responses:
+        '201':
+          description: Created variant resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminVariantResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/products/{product}/variants/{variant}:
+    parameters:
+      - {name: product, in: path, required: true, schema: {type: integer, minimum: 1}}
+      - {name: variant, in: path, required: true, schema: {type: integer, minimum: 1}}
+    patch:
+      operationId: adminUpdateProductVariant
+      summary: Update a product variant (Admin only)
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AdminVariantUpdate'}
+      responses:
+        '200':
+          description: Updated variant resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminVariantResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/products/{product}/image:
+    parameters:
+      - {name: product, in: path, required: true, schema: {type: integer, minimum: 1}}
+    post:
+      operationId: adminUploadProductImage
+      summary: Upload or replace a product image (image manager)
+      description: Accepts JPEG, PNG, or WebP up to 8 MiB and 6000 pixels per edge. The server strips metadata and creates WebP renditions.
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: {$ref: '#/components/schemas/ImageUpload'}
+      responses:
+        '201':
+          description: Uploaded image resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminImageResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/categories:
+    get:
+      operationId: adminListCategories
+      summary: List categories with product counts (catalogue readers)
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Category resources including inactive categories.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminCategoryListResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+    post:
+      operationId: adminCreateCategory
+      summary: Create a category (Admin only)
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AdminCategoryCreate'}
+      responses:
+        '201':
+          description: Created category resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminCategoryResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/categories/{category}:
+    parameters:
+      - {name: category, in: path, required: true, schema: {type: integer, minimum: 1}}
+    patch:
+      operationId: adminUpdateCategory
+      summary: Update a category (Admin only)
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AdminCategoryUpdate'}
+      responses:
+        '200':
+          description: Updated category resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminCategoryResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/hair-types:
+    get:
+      operationId: adminListHairTypes
+      summary: List hair types with ids (catalogue readers)
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Hair types in display order.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminHairTypeListResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+  /api/v1/admin/delivery-areas:
+    get:
+      operationId: adminListDeliveryAreas
+      summary: List delivery areas (catalogue readers)
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: All delivery areas in display order, including inactive areas.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminDeliveryAreaListResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+    post:
+      operationId: adminCreateDeliveryArea
+      summary: Create a delivery area (Admin only)
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AdminDeliveryAreaCreate'}
+      responses:
+        '201':
+          description: Created delivery area resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminDeliveryAreaResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/delivery-areas/{deliveryArea}:
+    parameters:
+      - {name: deliveryArea, in: path, required: true, schema: {type: integer, minimum: 1}}
+    patch:
+      operationId: adminUpdateDeliveryArea
+      summary: Update a delivery area (Admin only)
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AdminDeliveryAreaUpdate'}
+      responses:
+        '200':
+          description: Updated delivery area resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminDeliveryAreaResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/payments/reconciliation:
+    get:
+      operationId: adminListPaymentReconciliation
+      summary: List payment attempts requiring reconciliation (Admin only)
+      description: Lists mismatched attempts and successfully verified attempts without an order. This endpoint is read-only and does not call Paystack.
+      security: [{sanctumSession: []}]
+      parameters:
+        - {name: page, in: query, schema: {type: integer, minimum: 1, default: 1}}
+        - {name: perPage, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 15}}
+      responses:
+        '200':
+          description: Safe payment reconciliation records with pagination metadata.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminReconciliationPageResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/refunds:
+    get:
+      operationId: adminListRefunds
+      summary: List cancellation/refund requests (both roles)
+      description: Newest first. `needsReconciliation=true` lists COMPLETED requests whose order is not REFUNDED (provider confirmed money but the order could not be moved).
+      security: [{sanctumSession: []}]
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [REQUESTED, UNDER_REVIEW, APPROVED, REJECTED, PROCESSING, COMPLETED, FAILED]}}
+        - {name: needsReconciliation, in: query, schema: {type: boolean}}
+        - {name: open, in: query, description: 'true lists REQUESTED, UNDER_REVIEW, APPROVED and PROCESSING requests (the dashboard openRefundRequests set).', schema: {type: boolean}}
+        - {name: orderNumber, in: query, description: 'Exact order number, case-insensitive.', schema: {type: string, maxLength: 40}}
+        - {name: page, in: query, schema: {type: integer, minimum: 1, default: 1}}
+        - {name: perPage, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 15}}
+      responses:
+        '200':
+          description: Refund requests with pagination metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/AdminRefund'}
+                  meta: {$ref: '#/components/schemas/PaginationMeta'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/refunds/{id}:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: integer}}
+    get:
+      operationId: adminShowRefund
+      summary: Refund request with transactions and notes (both roles)
+      security: [{sanctumSession: []}]
+      responses:
+        '200': {$ref: '#/components/responses/AdminRefundOk'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/v1/admin/refunds/{id}/notes:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: integer}}
+    post:
+      operationId: adminAddRefundNote
+      summary: Append an internal refund note (both roles)
+      description: Notes are append-only; there is no edit or delete.
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: {type: string, minLength: 1, maxLength: 2000}
+      responses:
+        '201':
+          description: Created note.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: {$ref: '#/components/schemas/AdminOrderNote'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/refunds/{id}/decision:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: integer}}
+    post:
+      operationId: adminDecideRefund
+      summary: Approve or reject a refund request (ADMIN only)
+      description: >-
+        website-spec section 16.2. The decision and its order check are committed atomically (409 REFUND_NOT_DECIDABLE if
+        already decided; 409 REFUND_ORDER_NOT_REFUNDABLE if approving after dispatch; rejection is always possible).
+        REJECT requires `reason`. APPROVE on an ONLINE order then calls Paystack `POST /refund` (no automatic retry) and
+        moves the request to PROCESSING; a definitive provider refusal records a FAILED transaction and sets the request
+        FAILED (502 REFUND_REJECTED_BY_PROVIDER); an unknown outcome (timeout/5xx) leaves it APPROVED (503
+        REFUND_PROVIDER_UNAVAILABLE; do not re-submit, the webhook resolves it). APPROVE on a MANUAL order stays APPROVED
+        until manual completion. The order is never marked REFUNDED here; only provider or manual confirmation does that.
+        While APPROVED/PROCESSING, moving the order to DISPATCHED returns 409 REFUND_IN_PROGRESS.
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [decision]
+              properties:
+                decision: {type: string, enum: [APPROVE, REJECT]}
+                reason: {type: string, minLength: 3, maxLength: 1000, nullable: true, description: Required for REJECT.}
+      responses:
+        '200': {$ref: '#/components/responses/AdminRefundOk'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+        '502': {description: Provider refused the refund (REFUND_REJECTED_BY_PROVIDER); request is FAILED., content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {description: Provider outcome unknown (REFUND_PROVIDER_UNAVAILABLE); request stays APPROVED., content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+  /api/v1/admin/refunds/{id}/retry:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: integer}}
+    post:
+      operationId: adminRetryRefund
+      summary: Re-attempt the Paystack refund for an APPROVED online request (ADMIN only)
+      description: >-
+        Valid only while the request is APPROVED, the order is ONLINE and still pre-dispatch, and no refund transaction
+        row exists (409 REFUND_NOT_RETRYABLE otherwise, including while another attempt is outstanding). The amount is
+        always the order total. Before any POST the retry lists existing Paystack refunds for the charge (GET /refund): a refund that is not failed is adopted (one PENDING transaction row, request PROCESSING, no POST); an unreachable or unmatchable lookup returns 503 and sends nothing. Same outcomes as the decision (200 PROCESSING, 502 REFUND_REJECTED_BY_PROVIDER with the
+        request FAILED, 503 REFUND_PROVIDER_UNAVAILABLE with the request still APPROVED).
+      security: [{sanctumSession: []}]
+      responses:
+        '200': {$ref: '#/components/responses/AdminRefundOk'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '502': {description: Provider refused the refund (REFUND_REJECTED_BY_PROVIDER)., content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+        '503': {description: Provider outcome unknown (REFUND_PROVIDER_UNAVAILABLE)., content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}
+  /api/v1/admin/refunds/{id}/manual-completion:
+    parameters:
+      - {name: id, in: path, required: true, schema: {type: integer}}
+    post:
+      operationId: adminCompleteManualRefund
+      summary: Record a manual refund and move the order to REFUNDED (ADMIN only)
+      description: >-
+        MANUAL orders only (409 REFUND_NOT_MANUAL otherwise); the request must be APPROVED. `amountMinor` must equal the
+        order total (422 AMOUNT_MISMATCH; partial refunds are out of scope). A reference already used by another refund
+        returns 409 DUPLICATE_REFUND_REFERENCE. Replaying the same completion is idempotent (200).
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [method, reference, amountMinor]
+              properties:
+                method: {type: string, enum: [MOMO, CARD, CASH_OR_OTHER]}
+                reference: {type: string, minLength: 3, maxLength: 100}
+                amountMinor: {type: integer, minimum: 1}
+      responses:
+        '200': {$ref: '#/components/responses/AdminRefundOk'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/orders:
+    get:
+      operationId: adminListOrders
+      summary: List orders (both roles)
+      description: Newest first. `from`/`to` filter createdAt; a date-only `to` includes that whole day. `search` matches order number, customer name, and phone.
+      security: [{sanctumSession: []}]
+      parameters:
+        - {name: status, in: query, schema: {$ref: '#/components/schemas/OrderStatus'}}
+        - {name: source, in: query, schema: {type: string, enum: [ONLINE, MANUAL]}}
+        - {name: from, in: query, schema: {type: string, format: date}}
+        - {name: to, in: query, schema: {type: string, format: date}}
+        - {name: search, in: query, schema: {type: string, maxLength: 100}}
+        - {name: page, in: query, schema: {type: integer, minimum: 1, default: 1}}
+        - {name: perPage, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 15}}
+      responses:
+        '200':
+          description: Admin order summaries with pagination metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/AdminOrder'}
+                  meta: {$ref: '#/components/schemas/PaginationMeta'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/orders/manual:
+    post:
+      operationId: adminCreateManualOrder
+      summary: Create an already-paid manual order (both roles)
+      description: >-
+        website-spec section 15. Payment was received outside checkout; the order enters at PAID with source MANUAL and
+        createdByStaffId set, and appends an initial status event and an audit row. Items are priced from the current
+        catalogue as snapshots; `amountPaidMinor` must equal that total (422 AMOUNT_MISMATCH). `confirm` must be the
+        boolean true. A `status` other than PAID is rejected (422). A payment reference already used by any order
+        (online or manual, compared case-insensitively) returns 409 DUPLICATE_PAYMENT_REFERENCE. Area may be any text so
+        special-arrangement deliveries can be recorded; text matching a delivery area name (case-insensitive, trimmed) is stored under the canonical name. Dispatches OrderPaid after commit like online orders.
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm, fullName, phone, region, area, address, paymentMethod, paymentReference, amountPaidMinor, items]
+              properties:
+                confirm: {type: boolean, enum: [true]}
+                status: {type: string, enum: [PAID]}
+                fullName: {type: string, minLength: 2, maxLength: 100}
+                phone: {type: string, pattern: '^(?:\\+233|0)[235][0-9]{8}$'}
+                email: {type: string, format: email, nullable: true}
+                region: {type: string, minLength: 2, maxLength: 80}
+                area: {type: string, minLength: 2, maxLength: 120}
+                address: {type: string, minLength: 5, maxLength: 200}
+                landmark: {type: string, nullable: true, minLength: 2, maxLength: 160}
+                ghanaPostGps: {type: string, nullable: true}
+                specialArrangement: {type: boolean, default: false}
+                paymentMethod: {type: string, enum: [MOMO, CARD, CASH_OR_OTHER]}
+                paymentReference: {type: string, minLength: 3, maxLength: 100}
+                amountPaidMinor: {type: integer, minimum: 1}
+                note: {type: string, nullable: true, maxLength: 2000}
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  items:
+                    type: object
+                    required: [slug, productCode, quantity]
+                    properties:
+                      slug: {type: string}
+                      productCode: {type: string}
+                      quantity: {type: integer, minimum: 1, maximum: 20}
+                      lineId: {type: string, nullable: true}
+                      parentLineId: {type: string, nullable: true}
+                      expectedUnitPriceMinor: {type: integer, minimum: 0}
+      responses:
+        '201':
+          description: Created order.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminOrderResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/orders/{number}:
+    parameters:
+      - {name: number, in: path, required: true, schema: {type: string}}
+    get:
+      operationId: adminShowOrder
+      summary: Read an order with items, status history, and notes (both roles)
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Full admin order.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminOrderResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/v1/admin/orders/{number}/transitions:
+    parameters:
+      - {name: number, in: path, required: true, schema: {type: string}}
+    post:
+      operationId: adminTransitionOrder
+      summary: Move an order to its next status (both roles); one-step-back corrections are Admin-only
+      description: >-
+        Goes through OrderStateMachine. CANCELLED and REFUNDED are reachable only through the refund flow. A correction
+        requires a reason and the ADMIN role (403 for Sales/Orders). Invalid moves return 409 INVALID_ORDER_TRANSITION
+        with `errors.allowedStatuses`.
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [toStatus]
+              properties:
+                toStatus: {$ref: '#/components/schemas/OrderStatus'}
+                reason: {type: string, nullable: true, maxLength: 500}
+      responses:
+        '200':
+          description: Updated order.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminOrderResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/orders/{number}/notes:
+    parameters:
+      - {name: number, in: path, required: true, schema: {type: string}}
+    post:
+      operationId: adminAddOrderNote
+      summary: Append an internal order note (both roles)
+      description: Notes are append-only; there is no edit or delete.
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: {type: string, minLength: 1, maxLength: 2000}
+      responses:
+        '201':
+          description: Created note.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: {$ref: '#/components/schemas/AdminOrderNote'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/orders/{number}/delivery:
+    parameters:
+      - {name: number, in: path, required: true, schema: {type: string}}
+    patch:
+      operationId: adminUpdateOrderDelivery
+      summary: Correct delivery details (Admin only, reason required)
+      description: Changes only the delivery snapshot; never the order status. Audited with before and after values and the reason. `area` is free text; text matching an existing delivery area name (case-insensitive, trimmed) is stored under the canonical name, anything else as typed.
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                region: {type: string, minLength: 2, maxLength: 80}
+                area: {type: string, minLength: 2, maxLength: 120}
+                address: {type: string, minLength: 5, maxLength: 200}
+                landmark: {type: string, minLength: 2, maxLength: 160}
+                ghanaPostGps: {type: string, pattern: '^[A-Z]{2}-[0-9]{3,4}-[0-9]{4}$'}
+                reason: {type: string, minLength: 5, maxLength: 500}
+      responses:
+        '200':
+          description: Updated order.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminOrderResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/orders/{number}/contents:
+    parameters:
+      - {name: number, in: path, required: true, schema: {type: string}}
+    patch:
+      operationId: adminUpdateOrderContents
+      summary: Change a Paid or Processing order's items (Admin only, settled offline)
+      description: >-
+        Replaces the order's items with the complete list sent. Lines kept by `itemId` with an unchanged quantity keep
+        their purchase-time price and snapshots; lines with a changed quantity and new lines (`slug` + `productCode`) are
+        priced from the current catalogue and must still be on sale. `totalPaidMinor` never changes.
+        Blocked while a refund request is open. When the items subtotal changes, `settlement.method` must not be NONE and
+        `settlement.note` is required. Appends an immutable content revision and an audit entry.
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items, reason, settlement, basedOnRevision]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  items:
+                    type: object
+                    required: [quantity]
+                    properties:
+                      itemId: {type: integer, description: 'An existing line of this order. An unchanged quantity keeps its paid price; a changed quantity is repriced from the catalogue.'}
+                      slug: {type: string, maxLength: 160}
+                      productCode: {type: string, maxLength: 80}
+                      expectedUnitPriceMinor: {type: integer, minimum: 0}
+                      quantity: {type: integer, minimum: 1, maximum: 20}
+                reason: {type: string, minLength: 5, maxLength: 500}
+                settlement:
+                  type: object
+                  required: [method]
+                  properties:
+                    method: {type: string, enum: [NONE, CASH, MOMO, BANK, OTHER]}
+                    note: {type: string, nullable: true, maxLength: 500}
+                basedOnRevision: {type: integer, minimum: 0, description: 'Number of content revisions the client saw; a mismatch is 409 ORDER_CONTENTS_CHANGED.'}
+      responses:
+        '200':
+          description: Updated order with items and contentRevisions.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminOrderResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/complaints:
+    get:
+      operationId: adminListComplaints
+      summary: List complaints (view-complaints)
+      description: Open complaints first and oldest first by default. Filters can be combined; mine means assigned to the caller.
+      security: [{sanctumSession: []}]
+      parameters:
+        - {name: status, in: query, schema: {type: string, enum: [NEW, IN_PROGRESS, RESOLVED]}}
+        - {name: mine, in: query, schema: {type: boolean}}
+        - {name: unassigned, in: query, schema: {type: boolean}}
+        - {name: page, in: query, schema: {type: integer, minimum: 1, default: 1}}
+        - {name: perPage, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 15}}
+      responses:
+        '200':
+          description: Complaint summaries and pagination metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data: {type: array, items: {$ref: '#/components/schemas/AdminComplaintListItem'}}
+                  meta: {$ref: '#/components/schemas/PaginationMeta'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/complaints/{reference}:
+    parameters:
+      - {name: reference, in: path, required: true, schema: {type: string, pattern: '^C-[0-9]{6,}$'}}
+    get:
+      operationId: adminShowComplaint
+      summary: Read complaint and complete event history (view-complaints)
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Complaint detail with linked summaries and events in append order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: {$ref: '#/components/schemas/AdminComplaint'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/v1/admin/complaints/{reference}/claim:
+    parameters:
+      - {name: reference, in: path, required: true, schema: {type: string}}
+    post:
+      operationId: adminClaimComplaint
+      summary: Claim or take over a complaint (handle-complaints)
+      security: [{sanctumSession: []}]
+      responses:
+        '200': {description: Complaint after claim; claiming NEW moves it to IN_PROGRESS.}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/complaints/{reference}/notes:
+    parameters:
+      - {name: reference, in: path, required: true, schema: {type: string}}
+    post:
+      operationId: adminAddComplaintNote
+      summary: Append a complaint note (handle-complaints)
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: {type: string, minLength: 1, maxLength: 2000}
+      responses:
+        '200': {description: Complaint detail with the appended note event.}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/complaints/{reference}/status:
+    parameters:
+      - {name: reference, in: path, required: true, schema: {type: string}}
+    post:
+      operationId: adminChangeComplaintStatus
+      summary: Change or reopen complaint status (handle-complaints)
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [toStatus]
+              properties:
+                toStatus: {type: string, enum: [IN_PROGRESS, RESOLVED]}
+                note: {type: string, nullable: true, maxLength: 2000, description: Required for resolution and reopening.}
+      responses:
+        '200': {description: Complaint detail with the appended status event.}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/dashboard:
+    get:
+      operationId: adminDashboard
+      summary: Business overview and live operational attention
+      description: >-
+        Response sections are optional and appear only when the staff member has the matching permission: salesMinor and salesTodayMinor require view-sales-figures; paid-order and stage counts require view-orders; openRefundRequests requires view-refunds; reconciliation counts and failedNotificationCount require view-reconciliation; complaint counts require view-complaints.
+        Calendar periods use Africa/Accra: today (default), week (Monday through Sunday), month, year, or custom.
+        Custom requires both from and to as YYYY-MM-DD, with to >= from and neither date after today in Africa/Accra; dates are prohibited for other periods.
+        startDate and endDate are inclusive; queries use half-open [start, midnight after end), converted to storage
+        timezone. paidOrders and salesMinor count payments in that range excluding CANCELLED and REFUNDED orders.
+        Legacy paidOrdersToday and salesTodayMinor always cover today, regardless of period; date is today's Accra date.
+        Stage and attention counts remain current totals. openRefundRequests counts REQUESTED, UNDER_REVIEW, APPROVED and
+        PROCESSING. `reconciliationCount` is the Phase 3 reconciliation set (MISMATCH or verified without an order).
+        failedNotificationCount counts notifications whose latest attempt is FAILED or EXHAUSTED.
+        Additive range.current analytics end today for running periods and use cash received minus processed refunds
+        issued in those dates, independent of later order status. range.previous is an elapsed comparison or null
+        without earlier payment history. Money analytics require view-sales-figures; returning-customer identities
+        additionally require view-customers. attentionQueue is live and bounded to ten oldest rows per kind;
+        attentionSummary counts all matching work. Payment exceptions require view-reconciliation.
+      security: [{sanctumSession: []}]
+      parameters:
+        - {name: period, in: query, schema: {type: string, enum: [today, week, month, year, custom], default: today}}
+        - {name: from, in: query, description: 'Required only for custom; inclusive start date in Africa/Accra.', schema: {type: string, format: date}}
+        - {name: to, in: query, description: 'Required only for custom; inclusive end date on or after from.', schema: {type: string, format: date}}
+      responses:
+        '200':
+          description: Dashboard summary.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: {$ref: '#/components/schemas/AdminDashboard'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/customers:
+    get:
+      operationId: adminListCustomers
+      summary: Search customers (both roles)
+      description: Most recent order first. `search` matches name, email, and phone in either 0XXXXXXXXX or +233 form.
+      security: [{sanctumSession: []}]
+      parameters:
+        - {name: search, in: query, schema: {type: string, maxLength: 100}}
+        - {name: page, in: query, schema: {type: integer, minimum: 1, default: 1}}
+        - {name: perPage, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 15}}
+      responses:
+        '200':
+          description: Customers with pagination metadata (orders and notes omitted).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/AdminCustomer'}
+                  meta: {$ref: '#/components/schemas/PaginationMeta'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/customers/{publicId}:
+    parameters:
+      - {name: publicId, in: path, required: true, schema: {type: string}}
+    get:
+      operationId: adminShowCustomer
+      summary: Read a customer with order history and notes (both roles)
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Customer with orders (newest first) and notes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: {$ref: '#/components/schemas/AdminCustomer'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+  /api/v1/admin/customers/{publicId}/notes:
+    parameters:
+      - {name: publicId, in: path, required: true, schema: {type: string}}
+    post:
+      operationId: adminAddCustomerNote
+      summary: Append an internal customer note (both roles)
+      description: Notes are append-only; there is no edit or delete.
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [body]
+              properties:
+                body: {type: string, minLength: 1, maxLength: 2000}
+      responses:
+        '201':
+          description: Created note.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: {$ref: '#/components/schemas/AdminOrderNote'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/bundles:
+    get:
+      operationId: adminListBundles
+      summary: List bundles (catalogue readers)
+      security: [{sanctumSession: []}]
+      parameters:
+        - {name: page, in: query, schema: {type: integer, minimum: 1, default: 1}}
+        - {name: perPage, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 15}}
+      responses:
+        '200':
+          description: Admin bundle resources with pagination metadata.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminBundlePageResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '422': {$ref: '#/components/responses/ValidationError'}
+    post:
+      operationId: adminCreateBundle
+      summary: Create a bundle (Admin only)
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AdminBundleCreate'}
+      responses:
+        '201':
+          description: Created admin bundle resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminBundleResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/bundles/{bundle}:
+    parameters:
+      - {name: bundle, in: path, required: true, schema: {type: integer, minimum: 1}}
+    get:
+      operationId: adminShowBundle
+      summary: Read a bundle and its components (catalogue readers)
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Admin bundle resource including internal component IDs and suggested price.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminBundleResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+    patch:
+      operationId: adminUpdateBundle
+      summary: Update a bundle and optionally replace its items (Admin only)
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AdminBundleUpdate'}
+      responses:
+        '200':
+          description: Updated admin bundle resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminBundleResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/bundles/{bundle}/publish:
+    parameters:
+      - {name: bundle, in: path, required: true, schema: {type: integer, minimum: 1}}
+    post:
+      operationId: adminPublishBundle
+      summary: Publish a bundle (catalogue publisher)
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Updated admin bundle resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminBundleResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+  /api/v1/admin/bundles/{bundle}/unpublish:
+    parameters:
+      - {name: bundle, in: path, required: true, schema: {type: integer, minimum: 1}}
+    post:
+      operationId: adminUnpublishBundle
+      summary: Unpublish a bundle (catalogue publisher)
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Updated admin bundle resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminBundleResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+  /api/v1/admin/bundles/{bundle}/image:
+    parameters:
+      - {name: bundle, in: path, required: true, schema: {type: integer, minimum: 1}}
+    post:
+      operationId: adminUploadBundleImage
+      summary: Upload or replace a bundle image (image manager)
+      description: Accepts JPEG, PNG, or WebP up to 8 MiB and 6000 pixels per edge. The server strips metadata and creates WebP renditions.
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: {$ref: '#/components/schemas/ImageUpload'}
+      responses:
+        '201':
+          description: Uploaded image resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdminImageResponse'}
+        '401': {$ref: '#/components/responses/Unauthenticated'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '419': {description: Missing or invalid CSRF token.}
+        '422': {$ref: '#/components/responses/ValidationError'}
+  /api/v1/admin/auth/login:
+    post:
+      operationId: staffLogin
+      summary: Log in with staff email and password
+      description: Requires a configured stateful Origin and X-XSRF-TOKEN. Five attempts per minute per email and IP, plus 30 per IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: {type: string, format: email}
+                password: {type: string, format: password, maxLength: 128}
+      responses:
+        '200':
+          description: Staff resource and rotated session cookie.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StaffResponse'}
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '419':
+          description: Missing or invalid CSRF token.
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /api/v1/admin/auth/me:
+    get:
+      operationId: currentStaff
+      summary: Read the signed-in staff account
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Staff resource including mustChangePassword.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StaffResponse'}
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+  /api/v1/admin/auth/logout:
+    post:
+      operationId: staffLogout
+      summary: Invalidate the current session
+      security: [{sanctumSession: []}]
+      responses:
+        '204':
+          description: Session invalidated and CSRF token rotated.
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '419':
+          description: Missing or invalid CSRF token.
+  /api/v1/admin/auth/password:
+    post:
+      operationId: changeStaffPassword
+      summary: Change own password and revoke other sessions
+      description: Allowed during forced password change. New password must be 12–128 characters with upper/lower case, a digit, and a symbol. Session rotates; the original 12-hour deadline remains.
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [currentPassword, newPassword, newPasswordConfirmation]
+              properties:
+                currentPassword: {type: string, format: password}
+                newPassword: {type: string, format: password, minLength: 12, maxLength: 128}
+                newPasswordConfirmation: {type: string, format: password}
+      responses:
+        '200':
+          description: Staff resource with mustChangePassword false.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StaffResponse'}
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '419':
+          description: Missing or invalid CSRF token.
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /api/v1/admin/staff:
+    get:
+      operationId: listStaff
+      summary: List staff (Admin only)
+      security: [{sanctumSession: []}]
+      parameters:
+        - {name: page, in: query, schema: {type: integer, minimum: 1}}
+        - {name: perPage, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 15}}
+      responses:
+        '200':
+          description: Staff resources with meta.page, meta.perPage and meta.total.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/Staff'}
+                  meta: {$ref: '#/components/schemas/PaginationMeta'}
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    post:
+      operationId: createStaff
+      summary: Create a staff account (Admin only)
+      description: Generates a temporary password, returned once, and requires a password change at login. Responses are never cacheable.
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, role]
+              properties:
+                name: {type: string, maxLength: 255}
+                email: {type: string, format: email, maxLength: 255}
+                role: {type: string, enum: [ADMIN, SALES_ORDERS, CUSTOMER_SERVICE]}
+      responses:
+        '201':
+          description: Staff resource in data and one-time temporaryPassword at the top level.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TemporaryStaffResponse'}
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '419':
+          description: Missing or invalid CSRF token.
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/admin/staff/{staff}:
+    parameters:
+      - {name: staff, in: path, required: true, schema: {type: integer, minimum: 1}}
+    patch:
+      operationId: updateStaff
+      summary: Change staff role or active state (Admin only)
+      description: Revokes every session on change. Self-disable, self-demotion and removing the last active Admin are rejected.
+      security: [{sanctumSession: []}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                role: {type: string, enum: [ADMIN, SALES_ORDERS, CUSTOMER_SERVICE]}
+                isActive: {type: boolean}
+      responses:
+        '200':
+          description: Updated staff resource.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StaffResponse'}
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '419':
+          description: Missing or invalid CSRF token.
+        '422':
+          $ref: '#/components/responses/ValidationError'
+  /api/v1/admin/staff/{staff}/reset-password:
+    parameters:
+      - {name: staff, in: path, required: true, schema: {type: integer, minimum: 1}}
+    post:
+      operationId: resetStaffPassword
+      summary: Reset another staff account password (Admin only)
+      description: Returns a generated temporaryPassword once, forces password change, and revokes all sessions. Five resets per minute per actor/IP. Use auth/password for your own account.
+      security: [{sanctumSession: []}]
+      responses:
+        '200':
+          description: Staff resource in data and one-time temporaryPassword at the top level; Cache-Control no-store.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TemporaryStaffResponse'}
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '419':
+          description: Missing or invalid CSRF token.
+        '429':
+          $ref: '#/components/responses/RateLimited'
+  /api/v1/admin/audit-logs:
+    get:
+      operationId: listAuditLogs
+      summary: Read append-only redacted audit events (Admin only)
+      security: [{sanctumSession: []}]
+      parameters:
+        - {name: actorId, in: query, schema: {type: integer, minimum: 1}}
+        - {name: action, in: query, schema: {type: string}}
+        - {name: targetType, in: query, schema: {type: string}}
+        - {name: targetId, in: query, schema: {type: string}}
+        - {name: from, in: query, description: Inclusive UTC or offset timestamp, schema: {type: string, format: date-time}}
+        - {name: to, in: query, description: Inclusive UTC or offset timestamp; a YYYY-MM-DD date includes the entire UTC day, schema: {type: string}}
+        - {name: page, in: query, schema: {type: integer, minimum: 1}}
+        - {name: perPage, in: query, schema: {type: integer, minimum: 1, maximum: 100, default: 15}}
+      responses:
+        '200':
+          description: Audit resources with meta.page, meta.perPage and meta.total; newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: {$ref: '#/components/schemas/AuditLog'}
+                  meta: {$ref: '#/components/schemas/PaginationMeta'}
+        '401':
+          $ref: '#/components/responses/Unauthenticated'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+components:
+  headers:
+    RequestId:
+      description: Supplied safe request identifier or a generated UUID.
+      schema:
+        type: string
+        maxLength: 128
+  securitySchemes:
+    sanctumSession:
+      type: apiKey
+      in: cookie
+      name: vhi_session
+      description: Stateful staff SPA session; unsafe requests also need X-XSRF-TOKEN.
+  schemas:
+    PaystackWebhook:
+      type: object
+      required: [event, data]
+      properties:
+        event: {type: string, minLength: 1, example: charge.success}
+        data:
+          type: object
+          description: Paystack event data. The receipt retains only allowlisted payment fields.
+          properties:
+            id: {oneOf: [{type: integer}, {type: string}]}
+            reference: {type: string, description: Required for charge.success}
+            amount: {oneOf: [{type: integer}, {type: string}]}
+            currency: {type: string}
+            status: {type: string}
+            channel: {type: string}
+            paid_at: {type: string}
+            metadata:
+              oneOf:
+                - type: object
+                  properties:
+                    attemptId: {type: string}
+                - type: string
+      additionalProperties: true
+    PaystackWebhookResponse:
+      type: object
+      required: [received]
+      properties:
+        received: {type: boolean, enum: [true]}
+    CheckoutRequest:
+      type: object
+      required: [fullName, phone, email, region, area, address, landmark, ghanaPostGps, policyAccepted, items]
+      properties:
+        fullName: {type: string, minLength: 2, maxLength: 100}
+        phone: {type: string, pattern: '^(?:\+233|0)[235][0-9]{8}$'}
+        email: {type: string, format: email}
+        region: {type: string, minLength: 2, maxLength: 80}
+        area: {type: string, minLength: 2}
+        address: {type: string, minLength: 5, maxLength: 200}
+        landmark: {type: string, minLength: 2, maxLength: 160}
+        ghanaPostGps: {type: string, pattern: '^[A-Z]{2}-[0-9]{3,4}-[0-9]{4}$'}
+        policyAccepted: {type: boolean, enum: [true]}
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: object
+            required: [slug, productCode, quantity]
+            properties:
+              slug: {type: string}
+              productCode: {type: string}
+              quantity: {type: integer, minimum: 1, maximum: 20}
+              lineId: {type: string, maxLength: 40, nullable: true}
+              parentLineId: {type: string, maxLength: 40, nullable: true}
+              expectedUnitPriceMinor: {type: integer, minimum: 0}
+    CheckoutResponse:
+      type: object
+      required: [authorizationUrl, reference]
+      properties:
+        authorizationUrl: {type: string, format: uri}
+        reference: {type: string}
+    CheckoutStatusResponse:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status: {type: string, enum: [PENDING, SUCCEEDED, FAILED]}
+        orderNumber: {type: string}
+        trackingToken: {type: string}
+        retryable: {type: boolean}
+    CheckoutError:
+      type: object
+      required: [message, code, errors]
+      properties:
+        message: {type: string}
+        code: {type: string, enum: [VALIDATION_ERROR, CHECKOUT_ITEMS_CHANGED]}
+        errors: {type: object, additionalProperties: {type: array, items: {type: string}}}
+        issues:
+          type: array
+          items:
+            type: object
+            required: [index, reason]
+            properties:
+              index: {type: integer}
+              lineId: {type: string, nullable: true}
+              reason: {type: string, enum: [ITEM_UNAVAILABLE, PRICE_CHANGED]}
+              priceMinor: {type: integer, minimum: 0}
+    Staff:
+      type: object
+      required: [id, name, email, role, permissions, isActive, mustChangePassword, lastLoginAt, lastLoginIp, createdAt]
+      properties:
+        id: {type: integer, minimum: 1}
+        name: {type: string}
+        email: {type: string, format: email}
+        role: {type: string, enum: [ADMIN, SALES_ORDERS, CUSTOMER_SERVICE]}
+        permissions:
+          type: array
+          description: Effective permission values for this staff member; authorization is based on these values.
+          items: {type: string, enum: [view-dashboard, view-sales-figures, view-orders, update-order-status, add-order-notes, create-manual-orders, edit-order-delivery, edit-order-contents, view-refunds, add-refund-notes, decide-refunds, process-refunds, view-customers, add-customer-notes, view-catalogue, manage-catalogue, publish-catalogue, manage-images, view-complaints, handle-complaints, view-reconciliation, manage-staff, view-audit, change-own-password]}
+        isActive: {type: boolean}
+        mustChangePassword: {type: boolean}
+        lastLoginAt: {type: string, format: date-time, nullable: true}
+        lastLoginIp: {type: string, nullable: true}
+        createdAt: {type: string, format: date-time, nullable: true}
+    StaffResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/Staff'}
+    TemporaryStaffResponse:
+      allOf:
+        - {$ref: '#/components/schemas/StaffResponse'}
+        - type: object
+          required: [temporaryPassword]
+          properties:
+            temporaryPassword:
+              type: string
+              description: Generated temporary credential. Returned once; never stored or logged in plain text.
+    AuditLog:
+      type: object
+      required: [id, actorType, actorId, action, targetType, targetId, before, after, requestId, ipAddress, createdAt]
+      properties:
+        id: {type: integer}
+        actorType: {type: string, enum: [STAFF, SYSTEM]}
+        actorId: {type: integer, nullable: true}
+        action: {type: string}
+        targetType: {type: string, nullable: true}
+        targetId: {type: string, nullable: true}
+        before:
+          description: Redacted prior summary; an empty summary serializes as an empty array.
+          oneOf:
+            - {type: object, additionalProperties: true}
+            - {type: array, maxItems: 0, items: {}}
+        after:
+          description: Redacted resulting summary; an empty summary serializes as an empty array.
+          oneOf:
+            - {type: object, additionalProperties: true}
+            - {type: array, maxItems: 0, items: {}}
+        requestId: {type: string, maxLength: 128}
+        ipAddress: {type: string, nullable: true}
+        createdAt: {type: string, format: date-time}
+    PublicProduct:
+      type: object
+      additionalProperties: false
+      required: [slug, name, category, image, imagePosition, isNewLook, hairTypes, variants, currency]
+      properties:
+        slug: {type: string}
+        name: {type: string}
+        category: {type: string}
+        image:
+          allOf:
+            - {$ref: '#/components/schemas/CatalogImage'}
+          nullable: true
+        imagePosition: {type: string}
+        isNewLook: {type: boolean}
+        hairTypes:
+          type: array
+          items: {type: string}
+        variants:
+          type: array
+          items: {$ref: '#/components/schemas/PublicVariant'}
+        currency: {type: string, enum: [GHS]}
+    PublicVariant:
+      type: object
+      additionalProperties: false
+      required: [label, productCode, priceMinor]
+      properties:
+        label: {type: string}
+        productCode: {type: string}
+        priceMinor: {type: integer, format: int64, minimum: 0, description: Price in pesewas}
+    CatalogImage:
+      type: object
+      additionalProperties: false
+      required: [url, urls, alt, widths]
+      properties:
+        url: {type: string, format: uri}
+        urls:
+          type: object
+          description: Rendition URLs keyed by 400/800/1200 size presets. Files never upscale a smaller source; do not infer actual pixel width from a preset key.
+          additionalProperties: {type: string, format: uri}
+          example: {"400": https://api.vidorckhair.com/media/01JABC/400.webp, "800": https://api.vidorckhair.com/media/01JABC/800.webp}
+        alt: {type: string}
+        widths:
+          type: array
+          items: {type: integer, enum: [400, 800, 1200]}
+    PublicBundle:
+      type: object
+      additionalProperties: false
+      required: [slug, name, productCode, eyebrow, items, priceMinor, currency, image]
+      properties:
+        slug: {type: string}
+        name: {type: string}
+        productCode: {type: string}
+        eyebrow: {type: string, nullable: true}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/PublicBundleItem'}
+        priceMinor: {type: integer, format: int64, minimum: 0, description: Stored bundle price in pesewas}
+        currency: {type: string, enum: [GHS]}
+        image:
+          allOf:
+            - {$ref: '#/components/schemas/CatalogImage'}
+          nullable: true
+    PublicBundleItem:
+      type: object
+      additionalProperties: false
+      required: [product, variant, quantity]
+      properties:
+        product: {$ref: '#/components/schemas/PublicProduct'}
+        variant: {$ref: '#/components/schemas/PublicVariant'}
+        quantity: {type: integer, minimum: 1}
+    Category:
+      type: object
+      additionalProperties: false
+      required: [name, slug, displayOrder]
+      properties:
+        name: {type: string}
+        slug: {type: string}
+        displayOrder: {type: integer, minimum: 0}
+    HairType:
+      type: object
+      additionalProperties: false
+      required: [name, slug, displayOrder]
+      properties:
+        name: {type: string}
+        slug: {type: string}
+        displayOrder: {type: integer, minimum: 0}
+    PublicProductResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/PublicProduct'}
+    PublicBundleResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/PublicBundle'}
+    PublicProductPageResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/PublicProduct'}
+        meta:
+          allOf:
+            - {$ref: '#/components/schemas/PaginationMeta'}
+            - type: object
+              required: [facets]
+              properties:
+                facets: {$ref: '#/components/schemas/ProductFacets'}
+    ProductFacets:
+      type: object
+      description: Global counts computed from all publicly visible products, independent of q/category/hair_type.
+      required: [categories, hairTypes]
+      properties:
+        categories:
+          type: array
+          items: {$ref: '#/components/schemas/CatalogFacet'}
+        hairTypes:
+          type: array
+          items: {$ref: '#/components/schemas/CatalogFacet'}
+    CatalogFacet:
+      type: object
+      additionalProperties: false
+      required: [slug, name, count]
+      properties:
+        slug: {type: string}
+        name: {type: string}
+        count: {type: integer, minimum: 0}
+    PublicBundlePageResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/PublicBundle'}
+        meta: {$ref: '#/components/schemas/PaginationMeta'}
+    CategoryListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/Category'}
+    DeliveryArea:
+      type: object
+      additionalProperties: false
+      required: [name, aliases]
+      properties:
+        name: {type: string}
+        aliases: {type: array, items: {type: string}}
+    DeliveryAreaListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/DeliveryArea'}
+    HairTypeListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/HairType'}
+    SlugRedirectResponse:
+      type: object
+      additionalProperties: false
+      required: [redirectTo]
+      properties:
+        redirectTo: {type: string}
+    AdminProduct:
+      type: object
+      required: [id, name, slug, categoryId, category, displayOrder, isPublished, isNewLook, imageAlt, imagePosition, hairTypeIds, hairTypes, variants, image]
+      properties:
+        id: {type: integer, minimum: 1}
+        name: {type: string}
+        slug: {type: string}
+        categoryId: {type: integer, minimum: 1}
+        category: {type: string, nullable: true}
+        displayOrder: {type: integer, minimum: 0}
+        isPublished: {type: boolean}
+        isNewLook: {type: boolean}
+        imageAlt: {type: string, nullable: true}
+        imagePosition: {type: string}
+        hairTypeIds:
+          type: array
+          items: {type: integer, minimum: 1}
+        hairTypes:
+          type: array
+          items: {$ref: '#/components/schemas/AdminHairType'}
+        variants:
+          type: array
+          items: {$ref: '#/components/schemas/AdminVariant'}
+        image:
+          allOf:
+            - {$ref: '#/components/schemas/CatalogImage'}
+          nullable: true
+    AdminHairType:
+      type: object
+      required: [id, name, slug]
+      properties:
+        id: {type: integer, minimum: 1}
+        name: {type: string}
+        slug: {type: string}
+    AdminVariant:
+      type: object
+      required: [id, productId, label, normalizedSize, productCode, sourcePriceMinor, priceMinor, isActive, displayOrder]
+      properties:
+        id: {type: integer, minimum: 1}
+        productId: {type: integer, minimum: 1}
+        label: {type: string}
+        normalizedSize: {type: string}
+        productCode: {type: string}
+        sourcePriceMinor: {type: integer, format: int64, minimum: 0, nullable: true, description: Internal source price in pesewas; null when only an explicit selling price was supplied}
+        priceMinor: {type: integer, format: int64, minimum: 0}
+        isActive: {type: boolean}
+        displayOrder: {type: integer, minimum: 0}
+    AdminProductResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/AdminProduct'}
+    AdminProductPageResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/AdminProduct'}
+        meta: {$ref: '#/components/schemas/PaginationMeta'}
+    AdminProductCreate:
+      type: object
+      required: [name, categoryId]
+      properties:
+        name: {type: string, maxLength: 255}
+        slug: {type: string, maxLength: 255, pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$'}
+        categoryId: {type: integer, minimum: 1}
+        hairTypeIds:
+          type: array
+          items: {type: integer, minimum: 1}
+        displayOrder: {type: integer, minimum: 0, maximum: 1000000}
+        isPublished: {type: boolean}
+        isNewLook: {type: boolean}
+        imageAlt: {type: string, nullable: true, maxLength: 255}
+        imagePosition: {type: string, maxLength: 100}
+        variants:
+          type: array
+          items: {$ref: '#/components/schemas/AdminVariantCreate'}
+    AdminProductUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        name: {type: string, maxLength: 255}
+        slug: {type: string, maxLength: 255, pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$'}
+        categoryId: {type: integer, minimum: 1}
+        hairTypeIds:
+          type: array
+          items: {type: integer, minimum: 1}
+        displayOrder: {type: integer, minimum: 0, maximum: 1000000}
+        isPublished: {type: boolean}
+        isNewLook: {type: boolean}
+        imageAlt: {type: string, nullable: true, maxLength: 255}
+        imagePosition: {type: string, maxLength: 100}
+    AdminVariantCreate:
+      type: object
+      required: [label, productCode]
+      anyOf:
+        - {required: [sourcePriceMinor]}
+        - {required: [priceMinor]}
+      properties:
+        label: {type: string, maxLength: 255}
+        productCode: {type: string, maxLength: 255}
+        sourcePriceMinor: {type: integer, minimum: 0, maximum: 1000000000, nullable: true}
+        priceMinor: {type: integer, minimum: 0, maximum: 1000000000}
+        isActive: {type: boolean}
+        displayOrder: {type: integer, minimum: 0, maximum: 1000000}
+    AdminVariantUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        label: {type: string, maxLength: 255}
+        productCode: {type: string, maxLength: 255}
+        sourcePriceMinor: {type: integer, minimum: 0, maximum: 1000000000, nullable: true}
+        priceMinor: {type: integer, minimum: 0, maximum: 1000000000}
+        isActive: {type: boolean}
+        displayOrder: {type: integer, minimum: 0, maximum: 1000000}
+    AdminVariantResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/AdminVariant'}
+    AdminVariantListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/AdminVariant'}
+    AdminCategory:
+      type: object
+      required: [id, name, slug, displayOrder, isActive, productCount]
+      properties:
+        id: {type: integer, minimum: 1}
+        name: {type: string}
+        slug: {type: string}
+        displayOrder: {type: integer, minimum: 0}
+        isActive: {type: boolean}
+        productCount: {type: integer, minimum: 0}
+    AdminCategoryResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/AdminCategory'}
+    AdminCategoryListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/AdminCategory'}
+    AdminHairTypeListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/AdminHairTypeListItem'}
+    AdminHairTypeListItem:
+      type: object
+      additionalProperties: false
+      required: [id, name, slug, displayOrder]
+      properties:
+        id: {type: integer, minimum: 1}
+        name: {type: string}
+        slug: {type: string}
+        displayOrder: {type: integer, minimum: 0}
+    AdminDeliveryArea:
+      type: object
+      additionalProperties: false
+      required: [id, name, aliases, isActive, displayOrder]
+      properties:
+        id: {type: integer, minimum: 1}
+        name: {type: string}
+        aliases: {type: array, items: {type: string}}
+        isActive: {type: boolean}
+        displayOrder: {type: integer, minimum: 0}
+    AdminDeliveryAreaListResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/AdminDeliveryArea'}
+    AdminDeliveryAreaResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/AdminDeliveryArea'}
+    AdminDeliveryAreaCreate:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: {type: string, minLength: 2, maxLength: 100}
+        aliases:
+          type: array
+          maxItems: 20
+          uniqueItems: true
+          items: {type: string, minLength: 2, maxLength: 100}
+        isActive: {type: boolean, default: true}
+        displayOrder: {type: integer, minimum: 0, maximum: 1000000, default: 0}
+    AdminDeliveryAreaUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        name: {type: string, minLength: 2, maxLength: 100}
+        aliases:
+          type: array
+          maxItems: 20
+          uniqueItems: true
+          items: {type: string, minLength: 2, maxLength: 100}
+        isActive: {type: boolean}
+        displayOrder: {type: integer, minimum: 0, maximum: 1000000}
+    AdminReconciliationAttempt:
+      type: object
+      additionalProperties: false
+      required: [id, attemptId, reference, status, amountMinor, currency, expiresAt, createdAt, verifiedAt, lastVerifiedAt]
+      properties:
+        id: {type: integer, minimum: 1}
+        attemptId: {type: string, minLength: 26, maxLength: 26}
+        reference: {type: string}
+        status: {type: string, enum: [PENDING, SUCCEEDED, FAILED, ABANDONED, MISMATCH]}
+        amountMinor: {type: integer, minimum: 0}
+        currency: {type: string, minLength: 3, maxLength: 3}
+        expiresAt: {type: string, format: date-time, nullable: true}
+        createdAt: {type: string, format: date-time, nullable: true}
+        verifiedAt: {type: string, format: date-time, nullable: true}
+        lastVerifiedAt: {type: string, format: date-time, nullable: true}
+    AdminReconciliationPageResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/AdminReconciliationAttempt'}
+        meta: {$ref: '#/components/schemas/PaginationMeta'}
+    AdminCategoryCreate:
+      type: object
+      required: [name, slug]
+      properties:
+        name: {type: string, maxLength: 255}
+        slug: {type: string, maxLength: 255, pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$'}
+        displayOrder: {type: integer, minimum: 0, maximum: 1000000}
+        isActive: {type: boolean}
+    AdminCategoryUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        name: {type: string, maxLength: 255}
+        slug: {type: string, maxLength: 255, pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$'}
+        displayOrder: {type: integer, minimum: 0, maximum: 1000000}
+        isActive: {type: boolean}
+    AdminBundle:
+      type: object
+      required: [id, name, slug, productCode, eyebrow, priceMinor, suggestedPriceMinor, isPublished, isPubliclyVisible, displayOrder, imageAlt, items, image]
+      properties:
+        id: {type: integer, minimum: 1}
+        name: {type: string}
+        slug: {type: string}
+        productCode: {type: string}
+        eyebrow: {type: string, nullable: true}
+        priceMinor: {type: integer, format: int64, minimum: 0}
+        suggestedPriceMinor: {type: integer, format: int64, readOnly: true, description: Sum of current variant prices times quantities less the 300 pesewa bundle discount; the result is not clamped and may be negative}
+        isPublished: {type: boolean}
+        isPubliclyVisible: {type: boolean}
+        displayOrder: {type: integer, minimum: 0}
+        imageAlt: {type: string, nullable: true}
+        items:
+          type: array
+          items: {$ref: '#/components/schemas/AdminBundleItem'}
+        image:
+          allOf:
+            - {$ref: '#/components/schemas/CatalogImage'}
+          nullable: true
+    AdminBundleItem:
+      type: object
+      required: [id, variantId, quantity, displayOrder, product, variant]
+      properties:
+        id: {type: integer, minimum: 1}
+        variantId: {type: integer, minimum: 1}
+        quantity: {type: integer, minimum: 1}
+        displayOrder: {type: integer, minimum: 0}
+        product:
+          type: object
+          required: [id, name, slug]
+          properties:
+            id: {type: integer, minimum: 1}
+            name: {type: string}
+            slug: {type: string}
+        variant:
+          type: object
+          required: [id, label, productCode, priceMinor]
+          properties:
+            id: {type: integer, minimum: 1}
+            label: {type: string}
+            productCode: {type: string}
+            priceMinor: {type: integer, format: int64, minimum: 0}
+    AdminBundleResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/AdminBundle'}
+    AdminBundlePageResponse:
+      type: object
+      required: [data, meta]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/AdminBundle'}
+        meta: {$ref: '#/components/schemas/PaginationMeta'}
+    AdminBundleCreate:
+      type: object
+      required: [name, slug, productCode, priceMinor, items]
+      properties:
+        name: {type: string, maxLength: 255}
+        slug: {type: string, maxLength: 255, pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$'}
+        productCode: {type: string, maxLength: 255}
+        eyebrow: {type: string, nullable: true, maxLength: 255}
+        priceMinor: {type: integer, minimum: 0, maximum: 1000000000}
+        isPublished: {type: boolean}
+        displayOrder: {type: integer, minimum: 0, maximum: 1000000}
+        imageAlt: {type: string, nullable: true, maxLength: 255}
+        items:
+          type: array
+          minItems: 1
+          items: {$ref: '#/components/schemas/AdminBundleItemInput'}
+    AdminBundleUpdate:
+      type: object
+      minProperties: 1
+      properties:
+        name: {type: string, maxLength: 255}
+        slug: {type: string, maxLength: 255, pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$'}
+        productCode: {type: string, maxLength: 255}
+        eyebrow: {type: string, nullable: true, maxLength: 255}
+        priceMinor: {type: integer, minimum: 0, maximum: 1000000000}
+        isPublished: {type: boolean}
+        displayOrder: {type: integer, minimum: 0, maximum: 1000000}
+        imageAlt: {type: string, nullable: true, maxLength: 255}
+        items:
+          type: array
+          minItems: 1
+          description: Replaces the full component list when supplied.
+          items: {$ref: '#/components/schemas/AdminBundleItemInput'}
+    AdminBundleItemInput:
+      type: object
+      required: [variantId, quantity]
+      properties:
+        variantId: {type: integer, minimum: 1}
+        quantity: {type: integer, minimum: 1, maximum: 1000000}
+        displayOrder: {type: integer, minimum: 0, maximum: 1000000}
+    ImageUpload:
+      type: object
+      required: [image]
+      properties:
+        image: {type: string, format: binary, description: "JPEG, PNG, or WebP file, maximum size 8 MiB"}
+        alt: {type: string, nullable: true, maxLength: 255}
+    AdminImageResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: object
+          required: [image]
+          properties:
+            image: {$ref: '#/components/schemas/CatalogImage'}
+    Error:
+      type: object
+      required: [message, code, errors]
+      additionalProperties: false
+      properties:
+        message:
+          type: string
+          example: The given data was invalid.
+        code:
+          type: string
+          example: VALIDATION_ERROR
+        errors:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: string
+          example:
+            fullName: [A name is required.]
+    Money:
+      type: object
+      required: [amountMinor, currency]
+      additionalProperties: false
+      properties:
+        amountMinor:
+          type: integer
+          format: int64
+          description: Exact amount in pesewas; never a floating point value.
+          example: 14300
+        currency:
+          type: string
+          enum: [GHS]
+    PaginationMeta:
+      type: object
+      required: [page, perPage, total]
+      properties:
+        page:
+          type: integer
+          minimum: 1
+        perPage:
+          type: integer
+          minimum: 1
+          example: 15
+        total:
+          type: integer
+          minimum: 0
+    OrderStatus:
+      type: string
+      enum: [PAID, PROCESSING, READY_FOR_DISPATCH, DISPATCHED, DELIVERED, CANCELLED, REFUNDED]
+    CustomerOrder:
+      type: object
+      required: [orderNumber, status, createdAt, paidAt, totalPaidMinor, currency, items, timeline]
+      properties:
+        orderNumber: {type: string}
+        status: {$ref: '#/components/schemas/OrderStatus'}
+        createdAt: {type: string, format: date-time, nullable: true}
+        paidAt: {type: string, format: date-time, nullable: true}
+        totalPaidMinor: {type: integer}
+        currency: {type: string, enum: [GHS]}
+        items:
+          type: array
+          items:
+            type: object
+            required: [name, size, quantity]
+            properties:
+              name: {type: string}
+              size: {type: string, nullable: true}
+              quantity: {type: integer}
+        timeline:
+          type: array
+          description: Effective path only. A staff correction (step back) drops the statuses it reverses; each status appears once with its latest timestamp. Reasons and actors are never exposed.
+          items:
+            type: object
+            required: [status, at]
+            properties:
+              status: {$ref: '#/components/schemas/OrderStatus'}
+              at: {type: string, format: date-time, nullable: true}
+    OrderConfirmation:
+      type: object
+      required: [orderNumber, status, paidAt, totalPaidMinor, currency, deliveryFeeNote]
+      properties:
+        orderNumber: {type: string}
+        status: {$ref: '#/components/schemas/OrderStatus'}
+        paidAt: {type: string, format: date-time, nullable: true}
+        totalPaidMinor: {type: integer}
+        currency: {type: string, enum: [GHS]}
+        deliveryFeeNote: {type: string, nullable: true}
+    AdminRefund:
+      type: object
+      required: [id, status, channel, reason, order, needsReconciliation]
+      properties:
+        id: {type: integer}
+        status: {type: string, enum: [REQUESTED, UNDER_REVIEW, APPROVED, REJECTED, PROCESSING, COMPLETED, FAILED]}
+        channel: {type: string, enum: [WEB, WHATSAPP, STAFF]}
+        reason: {type: string}
+        requesterName: {type: string, nullable: true}
+        requesterPhone: {type: string, nullable: true}
+        decidedByStaffId: {type: integer, nullable: true}
+        decidedAt: {type: string, format: date-time, nullable: true}
+        decisionReason: {type: string, nullable: true}
+        createdAt: {type: string, format: date-time}
+        order:
+          type: object
+          properties:
+            orderNumber: {type: string}
+            status: {$ref: '#/components/schemas/OrderStatus'}
+            source: {type: string, enum: [ONLINE, MANUAL]}
+            totalPaidMinor: {type: integer}
+            currency: {type: string, enum: [GHS]}
+        needsReconciliation: {type: boolean, description: COMPLETED but the order is not REFUNDED.}
+        transactions:
+          type: array
+          description: Append-only refund facts (detail only).
+          items:
+            type: object
+            properties:
+              id: {type: integer}
+              method: {type: string, enum: [PAYSTACK, MANUAL]}
+              providerReference: {type: string, nullable: true}
+              amountMinor: {type: integer}
+              status: {type: string, enum: [PENDING, PROCESSED, FAILED]}
+              createdAt: {type: string, format: date-time}
+        notes:
+          type: array
+          items: {$ref: '#/components/schemas/AdminOrderNote'}
+        contentRevisions:
+          type: array
+          description: Detail responses only. Append-only history of item edits.
+          items:
+            type: object
+            properties:
+              id: {type: integer}
+              staffId: {type: integer}
+              staffName: {type: string}
+              reason: {type: string}
+              beforeItems: {type: array, items: {type: object, additionalProperties: true}}
+              afterItems: {type: array, items: {type: object, additionalProperties: true}}
+              beforeSubtotalMinor: {type: integer}
+              afterSubtotalMinor: {type: integer}
+              differenceMinor: {type: integer}
+              settlementMethod: {type: string, enum: [NONE, CASH, MOMO, BANK, OTHER]}
+              settlementNote: {type: string, nullable: true}
+              createdAt: {type: string, format: date-time}
+    AdminOrderNote:
+      type: object
+      required: [id, body, staffId, staffName, createdAt]
+      properties:
+        id: {type: integer}
+        body: {type: string}
+        staffId: {type: integer, nullable: true}
+        staffName: {type: string}
+        createdAt: {type: string, format: date-time}
+    AdminOrder:
+      type: object
+      description: List responses omit items, statusEvents, notes, and contentRevisions.
+      required: [orderNumber, status, allowedStatuses, source, totalPaidMinor, subtotalMinor, currency, paymentMethod, paymentReference, paidAt, createdAt, customer, delivery, deliveryFeeNote, createdByStaffId]
+      properties:
+        orderNumber: {type: string}
+        status: {$ref: '#/components/schemas/OrderStatus'}
+        allowedStatuses:
+          type: array
+          description: Statuses the calling staff member may move this order to (corrections included for Admin).
+          items: {$ref: '#/components/schemas/OrderStatus'}
+        source: {type: string, enum: [ONLINE, MANUAL]}
+        totalPaidMinor: {type: integer}
+        subtotalMinor: {type: integer}
+        currency: {type: string, enum: [GHS]}
+        paymentMethod: {type: string, nullable: true}
+        paymentReference: {type: string, nullable: true}
+        paidAt: {type: string, format: date-time, nullable: true}
+        createdAt: {type: string, format: date-time, nullable: true}
+        customer:
+          type: object
+          properties:
+            publicId: {type: string, nullable: true}
+            fullName: {type: string, nullable: true}
+            phone: {type: string, nullable: true}
+            email: {type: string, nullable: true}
+        delivery: {type: object, additionalProperties: true}
+        deliveryFeeNote: {type: string, nullable: true}
+        createdByStaffId: {type: integer, nullable: true}
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              id: {type: integer}
+              lineType: {type: string, enum: [PRODUCT, BUNDLE, BUNDLE_EXTRA]}
+              parentItemId: {type: integer, nullable: true}
+              name: {type: string}
+              size: {type: string, nullable: true}
+              productCode: {type: string}
+              imageRef: {type: string, nullable: true}
+              bundleContents: {nullable: true}
+              quantity: {type: integer}
+              unitPriceMinor: {type: integer}
+              lineTotalMinor: {type: integer}
+              currentUnitPriceMinor: {type: integer, nullable: true, description: 'Detail responses: today''s price for this item, or null when it is no longer on sale.'}
+        statusEvents:
+          type: array
+          items:
+            type: object
+            properties:
+              fromStatus: {$ref: '#/components/schemas/OrderStatus'}
+              toStatus: {$ref: '#/components/schemas/OrderStatus'}
+              actorType: {type: string, enum: [SYSTEM, STAFF]}
+              actorId: {type: integer, nullable: true}
+              reason: {type: string, nullable: true}
+              createdAt: {type: string, format: date-time, nullable: true}
+        notes:
+          type: array
+          items: {$ref: '#/components/schemas/AdminOrderNote'}
+        contentRevisions:
+          type: array
+          description: Detail responses only. Append-only history of item edits.
+          items:
+            type: object
+            properties:
+              id: {type: integer}
+              staffId: {type: integer}
+              staffName: {type: string}
+              reason: {type: string}
+              beforeItems: {type: array, items: {type: object, additionalProperties: true}}
+              afterItems: {type: array, items: {type: object, additionalProperties: true}}
+              beforeSubtotalMinor: {type: integer}
+              afterSubtotalMinor: {type: integer}
+              differenceMinor: {type: integer}
+              settlementMethod: {type: string, enum: [NONE, CASH, MOMO, BANK, OTHER]}
+              settlementNote: {type: string, nullable: true}
+              createdAt: {type: string, format: date-time}
+    AdminComplaintListItem:
+      type: object
+      required: [reference, topic, name, orderNumberEntered, status, assignedStaff, createdAt, updatedAt]
+      properties:
+        reference: {type: string}
+        topic: {type: string, enum: [ORDER_PROBLEM, PRODUCT_QUESTION, OTHER]}
+        name: {type: string}
+        orderNumberEntered: {type: string, nullable: true}
+        status: {type: string, enum: [NEW, IN_PROGRESS, RESOLVED]}
+        assignedStaff: {type: object, nullable: true, properties: {id: {type: integer}, name: {type: string}}}
+        createdAt: {type: string, format: date-time, nullable: true}
+        updatedAt: {type: string, format: date-time, nullable: true}
+    AdminComplaint:
+      allOf:
+        - {$ref: '#/components/schemas/AdminComplaintListItem'}
+        - type: object
+          required: [message, contactMethod, phone, email, resolvedAt, customer, order, events]
+          properties:
+            message: {type: string}
+            contactMethod: {type: string, enum: [CALL, WHATSAPP, EMAIL]}
+            phone: {type: string, nullable: true}
+            email: {type: string, format: email, nullable: true}
+            resolvedAt: {type: string, format: date-time, nullable: true}
+            customer: {type: object, nullable: true, properties: {publicId: {type: string}, fullName: {type: string}}}
+            order: {type: object, nullable: true, properties: {orderNumber: {type: string}, status: {type: string}}}
+            events:
+              type: array
+              items:
+                type: object
+                required: [id, type, fromStatus, toStatus, body, staffId, staffName, createdAt]
+                properties:
+                  id: {type: integer}
+                  type: {type: string, enum: [SUBMITTED, CLAIMED, NOTE, STATUS_CHANGED]}
+                  fromStatus: {type: string, nullable: true}
+                  toStatus: {type: string, nullable: true}
+                  body: {type: string, nullable: true}
+                  staffId: {type: integer, nullable: true}
+                  staffName: {type: string, nullable: true}
+                  createdAt: {type: string, format: date-time}
+    AdminDashboard:
+      type: object
+      required: [date, timezone, period, startDate, endDate]
+      properties:
+        date: {type: string, format: date, description: Today's date in Africa/Accra.}
+        timezone: {type: string, enum: [Africa/Accra]}
+        period: {type: string, enum: [today, week, month, year, custom]}
+        startDate: {type: string, format: date, description: Inclusive start date in Africa/Accra.}
+        endDate: {type: string, format: date, description: Inclusive end date in Africa/Accra.}
+        paidOrders: {type: integer, description: Non-cancelled/non-refunded orders paid in the selected range.}
+        salesMinor: {type: integer, description: Total paid in pesewas for the selected range.}
+        paidOrdersToday: {type: integer, description: Today's paid orders; retained for compatibility.}
+        salesTodayMinor: {type: integer, description: Today's sales in pesewas; retained for compatibility.}
+        currency: {type: string, enum: [GHS]}
+        processingCount: {type: integer}
+        readyForDispatchCount: {type: integer}
+        dispatchedCount: {type: integer}
+        openRefundRequests: {type: integer}
+        reconciliationCount: {type: integer}
+        refundReconciliationCount: {type: integer, description: 'Refund reconciliation items: refund.reconciliation_required audit rows plus COMPLETED requests whose order is not REFUNDED.'}
+        failedNotificationCount: {type: integer, description: Notifications whose latest attempt is FAILED or EXHAUSTED.}
+        newComplaints: {type: integer, description: NEW complaints; available with view-complaints.}
+        complaintsWaiting: {type: integer, description: NEW complaints older than 24 hours; available with view-complaints.}
+        range:
+          type: object
+          description: Available with view-sales-figures. Running dates end today; legacy top-level dates remain full calendar boundaries.
+          required: [current, previous]
+          properties:
+            current: {$ref: '#/components/schemas/DashboardRangeMetrics'}
+            previous:
+              allOf: [{$ref: '#/components/schemas/DashboardRangeMetrics'}]
+              nullable: true
+              description: Comparison metrics; null without earlier payment history. Customer identities are omitted.
+        attentionQueue:
+          type: array
+          maxItems: 40
+          description: Live oldest rows, up to ten per kind. Order amounts require view-orders, customer names view-customers, refund rows view-refunds, and payment exceptions view-reconciliation.
+          items: {$ref: '#/components/schemas/DashboardAttention'}
+        attentionSummary:
+          type: object
+          description: Unbounded live counts; keys are omitted when the corresponding permission is absent.
+          properties:
+            staleCount: {type: integer}
+            oldestChangedAt: {type: string, format: date-time, nullable: true}
+            openRefundCount: {type: integer}
+            unmatchedPaymentCount: {type: integer}
+            mismatchCount: {type: integer}
+            failedNotificationCount: {type: integer}
+            refundReconciliationCount: {type: integer}
+        checkoutOutcomes:
+          type: object
+          description: Selected elapsed period by checkout creation date. Amounts require view-sales-figures; unmatched/mismatch are live counts requiring view-reconciliation.
+          properties:
+            total: {type: integer}
+            paid: {type: integer}
+            failed: {type: integer}
+            abandoned: {type: integer}
+            successRatePercent: {type: integer}
+            unmatchedPayment: {type: integer}
+            mismatch: {type: integer}
+            paidAmountMinor: {type: integer}
+            failedAmountMinor: {type: integer}
+            abandonedAmountMinor: {type: integer}
+        fulfillment: {$ref: '#/components/schemas/DashboardFulfillment'}
+        fulfillmentComparison: {$ref: '#/components/schemas/DashboardFulfillment'}
+        refunds:
+          type: object
+          description: Refund counts require view-refunds; completed money also requires view-sales-figures and reconciliation counts view-reconciliation.
+          properties:
+            openRequests: {type: integer}
+            completedCount: {type: integer}
+            completedMinor: {type: integer}
+            failedReconciliation: {type: integer}
+        catalogue:
+          type: object
+          description: Retained paid orders excluding CANCELLED and REFUNDED. Variants aggregate by product; sets remain separate. Amounts and channels require view-sales-figures.
+          properties:
+            bestSellers:
+              type: array
+              maxItems: 4
+              items: {$ref: '#/components/schemas/DashboardCatalogueItem'}
+            bestSellersTotal: {type: integer}
+            unsold:
+              type: array
+              maxItems: 20
+              items: {$ref: '#/components/schemas/DashboardCatalogueItem'}
+            unsoldTotal: {type: integer}
+            sourceChannels:
+              type: array
+              items:
+                type: object
+                required: [source, count, salesMinor]
+                properties:
+                  source: {type: string, enum: [ONLINE, MANUAL]}
+                  count: {type: integer}
+                  salesMinor: {type: integer}
+    DashboardRangeMetrics:
+      type: object
+      required: [startDate, endDate, netSalesMinor, receivedMinor, refundsMinor, refundCount, paidOrders, averageOrderValueMinor]
+      properties:
+        startDate: {type: string, format: date}
+        endDate: {type: string, format: date}
+        netSalesMinor: {type: integer, description: Cash received less refunds issued in the same dates; may be negative.}
+        receivedMinor: {type: integer}
+        refundsMinor: {type: integer}
+        refundCount: {type: integer}
+        paidOrders: {type: integer, description: Includes paid orders later refunded or cancelled.}
+        averageOrderValueMinor: {type: integer}
+        returningCustomerPercent: {type: integer}
+        returningCustomerCount: {type: integer}
+        customerCount: {type: integer}
+        returningCustomers:
+          type: array
+          maxItems: 4
+          description: Current range only; requires view-customers as well as view-sales-figures.
+          items:
+            type: object
+            required: [publicId, name, orders, amountMinor, firstPurchaseDate]
+            properties:
+              publicId: {type: string}
+              name: {type: string}
+              orders: {type: integer}
+              amountMinor: {type: integer}
+              firstPurchaseDate: {type: string, format: date, nullable: true}
+    DashboardAttention:
+      type: object
+      required: [id, kind, orderNumber, status, amountMinor, currency, changedAt, ageHours, stale, reason]
+      properties:
+        id: {type: integer}
+        kind: {type: string, enum: [order, payment, mismatch, refund]}
+        orderNumber: {type: string, nullable: true}
+        status: {type: string}
+        customerName: {type: string, nullable: true}
+        customerPublicId: {type: string, nullable: true}
+        amountMinor: {type: integer}
+        currency: {type: string, enum: [GHS]}
+        changedAt: {type: string, format: date-time}
+        ageHours: {type: integer}
+        stale: {type: boolean}
+        reason: {type: string}
+    DashboardFulfillment:
+      type: object
+      description: view-orders required. Live stage counts, with durations for orders whose delivery status event falls in the selected elapsed range.
+      properties:
+        processing: {type: integer}
+        readyForDispatch: {type: integer}
+        dispatched: {type: integer}
+        deliveredCount: {type: integer}
+        averageHoursToDelivered: {type: integer, nullable: true}
+        averageHoursToDispatched: {type: integer, nullable: true}
+    DashboardCatalogueItem:
+      type: object
+      required: [catalogueType, productId, bundleId, name]
+      properties:
+        catalogueType: {type: string, enum: [product, bundle]}
+        productId: {type: integer, nullable: true}
+        bundleId: {type: integer, nullable: true}
+        name: {type: string}
+        quantity: {type: integer, description: Best sellers only.}
+        amountMinor: {type: integer, description: Best sellers only; omitted without view-sales-figures.}
+    AdminCustomer:
+      type: object
+      description: List responses omit orders and notes.
+      required: [publicId, fullName, phone, phoneE164, email, firstOrderAt, lastOrderAt, ordersCount, lifetimePaidMinor]
+      properties:
+        publicId: {type: string}
+        fullName: {type: string}
+        phone: {type: string}
+        phoneE164: {type: string}
+        email: {type: string, nullable: true}
+        firstOrderAt: {type: string, format: date-time, nullable: true}
+        lastOrderAt: {type: string, format: date-time, nullable: true}
+        ordersCount: {type: integer}
+        lifetimePaidMinor: {type: integer}
+        orders:
+          type: array
+          items:
+            type: object
+            required: [orderNumber, status, source, totalPaidMinor, currency, paidAt, createdAt]
+            properties:
+              orderNumber: {type: string}
+              status: {$ref: '#/components/schemas/OrderStatus'}
+              source: {type: string, enum: [ONLINE, MANUAL]}
+              totalPaidMinor: {type: integer}
+              currency: {type: string}
+              paidAt: {type: string, format: date-time, nullable: true}
+              createdAt: {type: string, format: date-time, nullable: true}
+        notes:
+          type: array
+          items: {$ref: '#/components/schemas/AdminOrderNote'}
+        contentRevisions:
+          type: array
+          description: Detail responses only. Append-only history of item edits.
+          items:
+            type: object
+            properties:
+              id: {type: integer}
+              staffId: {type: integer}
+              staffName: {type: string}
+              reason: {type: string}
+              beforeItems: {type: array, items: {type: object, additionalProperties: true}}
+              afterItems: {type: array, items: {type: object, additionalProperties: true}}
+              beforeSubtotalMinor: {type: integer}
+              afterSubtotalMinor: {type: integer}
+              differenceMinor: {type: integer}
+              settlementMethod: {type: string, enum: [NONE, CASH, MOMO, BANK, OTHER]}
+              settlementNote: {type: string, nullable: true}
+              createdAt: {type: string, format: date-time}
+    AdminOrderResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/AdminOrder'}
+  responses:
+    AdminRefundOk:
+      description: The refund request in its current state.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data]
+            properties:
+              data: {$ref: '#/components/schemas/AdminRefund'}
+    Unauthenticated:
+      description: Staff authentication is required.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: The requested operation is forbidden.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: The requested resource was not found.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Conflict:
+      description: The requested operation conflicts with the current state.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    ValidationError:
+      description: Request validation failed.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    RateLimited:
+      description: Too many requests.
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds before retrying.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'

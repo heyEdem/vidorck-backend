@@ -1,0 +1,14 @@
+{
+  "event": "charge.success",
+  "data": {
+    "id": 812345,
+    "status": "success",
+    "reference": "REF-WEBHOOK-1",
+    "amount": 1000,
+    "currency": "GHS",
+    "channel": "mobile_money",
+    "paid_at": "2026-10-10T10:00:00.000Z",
+    "metadata": {"attemptId": "01J9Z3N4BR1AK7M4FJQ5ED6CXY", "private": "remove-me"},
+    "authorization": {"authorization_code": "AUTH_SECRET", "bin": "411111", "last4": "1111"}
+  }
+}

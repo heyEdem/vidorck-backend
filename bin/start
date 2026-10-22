@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Runs the web server, queue worker and scheduler together.
+#   bin/start dev   local: reloads queue code on each job
+#   bin/start prod  production: caches config, binds 0.0.0.0:$PORT
+# If any process exits, the rest are stopped and the script exits non-zero
+# so the host/supervisor restarts the whole set.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+mode="${1:-dev}"
+port="${PORT:-8000}"
+
+case "$mode" in
+  dev)
+    host=127.0.0.1
+    # --timeout=0: the listener's wall-clock limit kills the whole set after sleep/App Nap; jobs keep their own $timeout.
+    queue=(php artisan queue:listen --tries=3 --timeout=0)
+    ;;
+  prod)
+    host=0.0.0.0
+    queue=(php artisan queue:work --tries=3 --max-time=3600)
+    php artisan optimize
+    export PHP_CLI_SERVER_WORKERS="${PHP_CLI_SERVER_WORKERS:-4}"
+    ;;
+  *)
+    echo "usage: bin/start [dev|prod]" >&2
+    exit 2
+    ;;
+esac
+
+pids=()
+stop() { kill "${pids[@]}" 2>/dev/null || true; wait 2>/dev/null || true; }
+trap stop EXIT
+trap 'exit 130' INT TERM
+
+php artisan serve --host="$host" --port="$port" & pids+=($!)
+"${queue[@]}" & pids+=($!)
+php artisan schedule:work & pids+=($!)
+
+# Bash 3.2 (macOS) has no `wait -n`, so poll for the first process to exit.
+while :; do
+  for pid in "${pids[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "bin/start: process $pid exited; stopping the rest" >&2
+      exit 1
+    fi
+  done
+  sleep 2
+done

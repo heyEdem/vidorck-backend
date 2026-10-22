@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+cd /var/www/html
+
+: "${APP_KEY:?Set a stable APP_KEY in the Render environment before starting the demo.}"
+: "${DB_DATABASE:?Set DB_DATABASE to an absolute SQLite file path.}"
+: "${LARAVEL_STORAGE_PATH:?Set LARAVEL_STORAGE_PATH to the persistent storage directory.}"
+
+case "$DB_DATABASE" in
+    /*) ;;
+    *) echo 'DB_DATABASE must be an absolute SQLite file path.' >&2; exit 1 ;;
+esac
+
+# A newly mounted disk hides directories created while building the image.
+mkdir -p "$(dirname "$DB_DATABASE")" \
+    "$LARAVEL_STORAGE_PATH/app/private" \
+    "$LARAVEL_STORAGE_PATH/app/public/media" \
+    "$LARAVEL_STORAGE_PATH/framework/cache/data" \
+    "$LARAVEL_STORAGE_PATH/framework/sessions" \
+    "$LARAVEL_STORAGE_PATH/framework/views" \
+    "$LARAVEL_STORAGE_PATH/logs" \
+    bootstrap/cache
+touch "$DB_DATABASE"
+
+# Apply Render's runtime environment before touching the mounted database.
+php artisan config:clear
+php artisan migrate --force
+php artisan storage:link --force
+
+# Keep the SQLite-backed queue and scheduler in the same service as the web app.
+exec bash bin/start prod
