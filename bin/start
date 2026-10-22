@@ -20,7 +20,15 @@ case "$mode" in
     host=0.0.0.0
     # --max-time recycles the worker hourly with exit 0; respawn it so that
     # doesn't restart the whole set (a restart wipes a disk-less Render demo).
-    work_queue() { while php artisan queue:work --tries=3 --max-time=3600; do :; done; }
+    # stop() only signals this subshell, so forward TERM to the worker and let it finish.
+    work_queue() {
+      worker=''
+      trap '[ -n "$worker" ] && kill -TERM "$worker" 2>/dev/null && wait "$worker"; exit 143' TERM
+      while :; do
+        php artisan queue:work --tries=3 --max-time=3600 & worker=$!
+        wait "$worker" || return
+      done
+    }
     queue=(work_queue)
     php artisan optimize
     export PHP_CLI_SERVER_WORKERS="${PHP_CLI_SERVER_WORKERS:-4}"
