@@ -1,0 +1,43 @@
+services:
+  app:
+    build: .
+    image: vidorck-backend-demo:local
+    ports:
+      - "127.0.0.1:${DEMO_PORT:-10000}:10000"
+    environment:
+      APP_NAME: Vidorck Hair Demo
+      APP_URL: "http://localhost:${DEMO_PORT:-10000}"
+      STOREFRONT_URL: "${DEMO_STOREFRONT_URL:-http://localhost:3000}"
+      ADMIN_URL: "${DEMO_ADMIN_URL:-http://localhost:3000/admin}"
+      CORS_ALLOWED_ORIGINS: "${DEMO_CORS_ALLOWED_ORIGINS:-http://localhost:3000}"
+      SANCTUM_STATEFUL_DOMAINS: "${DEMO_STATEFUL_DOMAINS:-localhost:3000}"
+      SESSION_COOKIE: vhi_demo_session
+      SESSION_SECURE_COOKIE: "false"
+      QUEUE_CONNECTION: database
+      CACHE_STORE: database
+      FILESYSTEM_DISK: public
+      LOG_CHANNEL: stderr
+      LOG_LEVEL: info
+      MAIL_MAILER: log
+      SMS_DRIVER: log
+    volumes:
+      - demo-data:/var/data
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        if [ ! -s /var/data/.demo-app-key ]; then
+          umask 077
+          php -r 'echo "base64:".base64_encode(random_bytes(32)), PHP_EOL;' > /var/data/.demo-app-key
+        fi
+        export APP_KEY="$$(cat /var/data/.demo-app-key)"
+        exec /usr/local/bin/start-app
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://127.0.0.1:10000/up') === false ? 1 : 0);"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  demo-data:

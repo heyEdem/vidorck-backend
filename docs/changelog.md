@@ -165,3 +165,11 @@
   existing web, queue, and scheduler runner.
 - Kept SQLite and uploaded media under one `/var/data` mount and documented Render
   environment variables, disk setup, and the disposable demo limitations.
+
+## 2026-10-22 — Local Docker Compose startup
+
+- Added `compose.yaml` so `docker compose up --build` runs the demo directly.
+- Generate a separate local application key on first start and retain it with
+  SQLite and uploaded media in a named Docker volume.
+- Added local HTTP cookie settings, a health check, and documented local startup
+  and administrator creation commands.

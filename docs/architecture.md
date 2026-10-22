@@ -16,6 +16,7 @@ separate repository. No Node build, Redis, or external database is required.
 | `docs/openapi.yaml` | Current HTTP contract |
 | `.github/workflows/ci.yml` | Dependency install, style, analysis, tests |
 | `Dockerfile`, `bin/render-start` | Render demo image and startup; SQLite and storage under `/var/data` |
+| `compose.yaml` | Local Docker demo with an HTTP port, health check, and a named volume for data and its local app key |
 
 The demo repository contains the application directly at its root. Render runs
 the existing web, queue, and scheduler processes together so they can share the

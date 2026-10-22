@@ -75,6 +75,36 @@ php artisan staff:create-admin
 
 ## Local Docker check
 
+From the repository root, run:
+
+```sh
+docker compose up --build
+```
+
+Compose builds the image and starts the API at `http://localhost:10000`, with the
+queue worker and scheduler in the same container. The local frontend defaults to
+`http://localhost:3000`. HTTP cookies are enabled for local use.
+
+The first start generates a separate local `APP_KEY` in the `demo-data` named
+volume. The key, SQLite database, and uploaded media survive container
+recreation. Compose does not forward your local `.env` credentials or database
+paths into the container. Render continues to use its explicitly configured
+`APP_KEY` and environment variables.
+
+To change the local port, use `DEMO_PORT=10001 docker compose up --build`.
+Frontend overrides are `DEMO_STOREFRONT_URL`, `DEMO_ADMIN_URL`,
+`DEMO_CORS_ALLOWED_ORIGINS`, and `DEMO_STATEFUL_DOMAINS`.
+
+Create a demo administrator in another terminal:
+
+```sh
+docker compose exec app php artisan staff:create-admin
+```
+
+Stop the local service with `docker compose down`; the named volume is retained.
+
+Alternatively, use Docker directly with an explicitly supplied application key:
+
 ```sh
 docker build -t vidorck-backend-demo .
 docker run --rm -p 10000:10000 \

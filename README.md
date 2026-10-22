@@ -7,6 +7,16 @@ frontend lives in the separate `VHI_Website` project.
 For this repository's Render demo, see [the Docker deployment guide](docs/render-demo.md).
 The Dockerfile and application files are directly at the repository root.
 
+To run the demo locally with Docker:
+
+```sh
+docker compose up --build
+```
+
+The API is available at `http://localhost:10000`; its health check is `/up`.
+Compose creates a local application key and preserves it with the SQLite database
+and uploaded media in a named volume. No manual environment setup is needed.
+
 ## Local setup
 
 Requirements: PHP 8.4 with PDO SQLite, mbstring, XML, ctype, fileinfo, GD, EXIF, OpenSSL,
